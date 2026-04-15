@@ -129,8 +129,10 @@ class DataIntelligence:
         """
         text_lengths = df[text_column].astype(str).str.len()
         
-        # Use 95th percentile as max_length (avoids truncation)
-        max_length = int(np.percentile(text_lengths, 95))
+        # p95 is in characters; convert to approximate token count (≈4 chars/token)
+        # and cap at 512 (transformer hard limit).
+        p95_chars = int(np.percentile(text_lengths, 95))
+        max_length = min(int(p95_chars / 4), 512)
         avg_length = text_lengths.mean()
         
         info = {

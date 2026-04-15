@@ -4,16 +4,16 @@ Handles model fine-tuning with hyperparameter tuning using Optuna
 """
 
 import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 from transformers import (
-    AutoTokenizer, 
+    AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
     EarlyStoppingCallback,
 )
-from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
@@ -22,39 +22,26 @@ from pathlib import Path
 import time
 from typing import Dict, Tuple, List
 
+from automl.dataset import TextDataset  # shared dataset
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class TextDataset(Dataset):
-    """PyTorch Dataset for text classification"""
-    
-    def __init__(self, texts: List[str], labels: List[int], tokenizer, max_length: int):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)
-        }
+class WeightedTrainer(Trainer):
+    """Trainer subclass that applies per-class weights to the cross-entropy loss."""
+
+    def __init__(self, class_weights_tensor=None, **kwargs):
+        super().__init__(**kwargs)
+        self.class_weights_tensor = class_weights_tensor
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss_fn = nn.CrossEntropyLoss(weight=self.class_weights_tensor)
+        loss = loss_fn(logits, labels)
+        return (loss, outputs) if return_outputs else loss
 
 
 class ModelTrainer:
@@ -217,17 +204,18 @@ class ModelTrainer:
             report_to=[],  # Disable wandb/tensorboard logging
         )
         
-        # Prepare model for training with class weights if needed
+        # Prepare class weights tensor (map string class names → integer indices)
         if use_class_weights and class_weights:
-            class_weights_tensor = torch.tensor(
-                [class_weights.get(i, 1.0) for i in range(data['num_classes'])]
-            ).to(self.device)
+            le = data['label_encoder']
+            int_weights = [class_weights.get(le.classes_[i], 1.0) for i in range(data['num_classes'])]
+            class_weights_tensor = torch.tensor(int_weights).float().to(self.device)
             logger.info(f"Class weights tensor: {class_weights_tensor}")
         else:
             class_weights_tensor = None
         
-        # Create trainer
-        trainer = Trainer(
+        # Create trainer (weighted when class weights are available)
+        trainer = WeightedTrainer(
+            class_weights_tensor=class_weights_tensor,
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -247,8 +235,6 @@ class ModelTrainer:
         except Exception as e:
             logger.error(f"❌ Training failed: {str(e)}", exc_info=True)
             raise
-        
-        training_time = time.time() - start_time
         
         training_time = time.time() - start_time
         
@@ -310,7 +296,7 @@ class ModelTrainer:
         for model_name in model_names:
             # Try different hyperparameter combinations
             for num_epochs in hyperparams_ranges['num_epochs_range']:
-                for lr_scale in [0.5, 1.0]:  # Scale learning rate
+                for lr_scale in [1.0]:  # single learning rate per epoch configuration
                     
                     learning_rate = hyperparams_ranges['learning_rate'] * lr_scale
                     batch_size = hyperparams_ranges['batch_size']
