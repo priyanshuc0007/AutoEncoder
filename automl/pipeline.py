@@ -129,7 +129,7 @@ class AutoMLPipeline:
             # Step 5: Evaluate models
             logger.info("\n📊 STEP 5: Model Evaluation")
             logger.info("-" * 70)
-            
+
             evaluation_results = []
             for train_result in self.training_results:
                 eval_result = self.evaluator.evaluate_model(
@@ -139,8 +139,9 @@ class AutoMLPipeline:
                     tokenizer=train_result['tokenizer'],
                     max_length=self.analysis['text_info']['p95_length'],
                     label_encoder=label_encoder,
+                    split='val',
                 )
-                
+
                 # Merge with training result
                 eval_result['model_name'] = train_result['model_name']
                 eval_result['model_path'] = train_result['model_path']
@@ -168,11 +169,39 @@ class AutoMLPipeline:
             # Step 7: Generate report
             logger.info("\n📋 STEP 7: Report Generation")
             logger.info("-" * 70)
+
+            # Also evaluate best model on training data for overfitting comparison
+            best_train_result = None
+            try:
+                best_train_result = self.evaluator.evaluate_model(
+                    model_path=best_model_path,
+                    texts=self.data['train_texts'],
+                    labels=self.data['train_labels'],
+                    tokenizer=self.training_results[0]['tokenizer'],
+                    max_length=self.analysis['text_info']['p95_length'],
+                    label_encoder=label_encoder,
+                    split='train',
+                )
+                best_train_result['model_name'] = best_model_result.get('model_name')
+                logger.info(
+                    f"Train  — Accuracy: {best_train_result['accuracy']:.4f}, "
+                    f"F1: {best_train_result['f1_score']:.4f}"
+                )
+                logger.info(
+                    f"Val    — Accuracy: {best_model_result['accuracy']:.4f}, "
+                    f"F1: {best_model_result['f1_score']:.4f}"
+                )
+                gap = best_train_result['f1_score'] - best_model_result['f1_score']
+                logger.info(f"F1 Gap (train - val): {gap:+.4f}")
+            except Exception as e:
+                logger.warning(f"Could not evaluate on training data: {e}")
+
             report_path = self.experiment_dir / "best_model_report.txt"
             self.evaluator.generate_report(
                 best_model_result,
                 label_encoder,
-                output_path=str(report_path)
+                output_path=str(report_path),
+                train_result=best_train_result,
             )
             
             # Save configuration

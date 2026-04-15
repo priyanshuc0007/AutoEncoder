@@ -78,7 +78,7 @@ def display_data_preview(df, label_col, text_col):
         st.metric("Missing Values", df.isnull().sum().sum())
     
     st.write("First few rows:")
-    st.dataframe(df.head(10), use_container_width=True)
+    st.dataframe(df.head(10), width='stretch')
     
     # Class distribution
     st.subheader("📊 Class Distribution")
@@ -118,7 +118,7 @@ def display_pipeline_results(result):
     st.subheader("📊 Model Comparison")
     comparison_df = result.get('comparison_df')
     if comparison_df is not None:
-        st.dataframe(comparison_df, use_container_width=True)
+        st.dataframe(comparison_df, width='stretch')
     
     # Experiment info
     st.subheader("ℹ️ Experiment Information")
@@ -252,7 +252,7 @@ with tab1:
             # Show preview with selected columns
             st.write("\n**Data Preview:**")
             preview_df = df[[label_column] + selected_text_columns].head(5)
-            st.dataframe(preview_df, use_container_width=True)
+            st.dataframe(preview_df, width='stretch')
             display_data_preview(df, label_column, selected_text_columns[0])
         
         # Start button
@@ -351,7 +351,7 @@ with tab3:
             for h in st.session_state.experiment_history
         ])
         
-        st.dataframe(history_df, use_container_width=True)
+        st.dataframe(history_df, width='stretch')
         
         # Select experiment to view
         if len(st.session_state.experiment_history) > 0:
