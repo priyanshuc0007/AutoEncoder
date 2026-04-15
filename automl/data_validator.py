@@ -48,7 +48,11 @@ class DataValidator:
         # Load CSV
         logger.info(f"Loading CSV from {csv_path}")
         try:
-            df = pd.read_csv(csv_path)
+            try:
+                df = pd.read_csv(csv_path, encoding='utf-8')
+            except UnicodeDecodeError:
+                logger.warning("UTF-8 decode failed, retrying with latin-1 encoding")
+                df = pd.read_csv(csv_path, encoding='latin-1')
         except Exception as e:
             raise ValueError(f"Failed to load CSV: {str(e)}")
         

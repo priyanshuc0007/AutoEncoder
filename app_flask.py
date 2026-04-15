@@ -294,7 +294,11 @@ def data_preview():
         file = request.files['file']
         
         # Read CSV
-        df = pd.read_csv(file)
+        try:
+            df = pd.read_csv(file, encoding='utf-8')
+        except UnicodeDecodeError:
+            file.seek(0)
+            df = pd.read_csv(file, encoding='latin-1')
         
         return jsonify({
             'columns': df.columns.tolist(),

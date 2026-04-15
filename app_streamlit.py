@@ -192,8 +192,12 @@ with tab1:
         )
     
     if uploaded_file is not None:
-        # Load and preview data
-        df = pd.read_csv(uploaded_file)
+        # Load and preview data — handle Windows (cp1252/latin-1) encoded files
+        try:
+            df = pd.read_csv(uploaded_file, encoding='utf-8')
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding='latin-1')
         
         st.subheader("📋 Step 2: Select Columns")
         
