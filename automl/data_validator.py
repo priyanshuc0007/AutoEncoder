@@ -253,14 +253,17 @@ class DataValidator:
             def smart_truncate(text):
                 """Truncate while preserving main content"""
                 if tokenizer is None:
-                    # Fallback: rough char-based truncation (≈4 chars per token)
-                    max_chars = int(max_tokens * 4 * 0.8)
+                    # Fallback: rough char-based truncation (≈4 chars per token),
+                    # keeping 80% of the limit to match the tokenizer-based path.
+                    _KEEP_RATIO = 0.8
+                    max_chars = int(max_tokens * 4 * _KEEP_RATIO)
                     return text[:max_chars] if len(text) > max_chars else text
 
                 tokens = tokenizer.encode(text, truncation=False)
                 if len(tokens) > max_tokens:
-                    # Keep first 80% of tokens for primary content
-                    truncated = tokenizer.decode(tokens[:int(max_tokens * 0.8)])
+        # Keep first 80% of tokens to preserve primary content over secondary
+                    _KEEP_RATIO = 0.8
+                    truncated = tokenizer.decode(tokens[:int(max_tokens * _KEEP_RATIO)])
                     return truncated
                 return text
             

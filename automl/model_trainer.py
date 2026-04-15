@@ -213,9 +213,9 @@ class ModelTrainer:
         else:
             class_weights_tensor = None
         
-        # Create trainer (weighted when class weights are available)
-        trainer = WeightedTrainer(
-            class_weights_tensor=class_weights_tensor,
+        # Create trainer (weighted when class weights are available, standard otherwise)
+        trainer_cls = WeightedTrainer if class_weights_tensor is not None else Trainer
+        trainer_kwargs = dict(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -223,6 +223,9 @@ class ModelTrainer:
             compute_metrics=self._compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
         )
+        if class_weights_tensor is not None:
+            trainer_kwargs['class_weights_tensor'] = class_weights_tensor
+        trainer = trainer_cls(**trainer_kwargs)
         
         # Train
         try:
