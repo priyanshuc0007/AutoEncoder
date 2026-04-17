@@ -4,16 +4,25 @@ Handles model fine-tuning with hyperparameter tuning using Optuna
 """
 
 import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 from transformers import (
-    AutoTokenizer, 
+    AutoTokenizer,
     AutoModelForSequenceClassification,
+    BertForSequenceClassification,
     TrainingArguments,
     Trainer,
     EarlyStoppingCallback,
 )
-from torch.utils.data import Dataset
+
+# Models that don't declare model_type in their config.json and need an explicit class
+MODEL_CLASS_OVERRIDES = {
+    "prajjwal1/bert-tiny":   BertForSequenceClassification,
+    "prajjwal1/bert-mini":   BertForSequenceClassification,
+    "prajjwal1/bert-small":  BertForSequenceClassification,
+    "prajjwal1/bert-medium": BertForSequenceClassification,
+}
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
@@ -22,39 +31,42 @@ from pathlib import Path
 import time
 from typing import Dict, Tuple, List
 
+from automl.dataset import TextDataset  # shared dataset
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class TextDataset(Dataset):
-    """PyTorch Dataset for text classification"""
-    
-    def __init__(self, texts: List[str], labels: List[int], tokenizer, max_length: int):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)
-        }
+class WeightedTrainer(Trainer):
+    """Trainer subclass that applies per-class weights and optional focal loss."""
+
+    def __init__(self, class_weights_tensor=None, use_focal_loss: bool = False, focal_gamma: float = 2.0, **kwargs):
+        super().__init__(**kwargs)
+        self.class_weights_tensor = class_weights_tensor
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        if self.use_focal_loss:
+            # Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+            # alpha_t is handled via class_weights_tensor (if provided)
+            ce_loss = nn.CrossEntropyLoss(
+                weight=self.class_weights_tensor, reduction='none'
+            )(logits, labels)
+            probs = torch.softmax(logits, dim=1)
+            # p_t: probability assigned to the correct class
+            p_t = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma
+            loss = (focal_weight * ce_loss).mean()
+        else:
+            loss_fn = nn.CrossEntropyLoss(weight=self.class_weights_tensor)
+            loss = loss_fn(logits, labels)
+
+        return (loss, outputs) if return_outputs else loss
 
 
 class ModelTrainer:
@@ -132,6 +144,7 @@ class ModelTrainer:
         max_length: int,
         use_class_weights: bool = False,
         class_weights: Dict = None,
+        use_focal_loss: bool = False,
         experiment_name: str = "default",
         gradient_accumulation_steps: int = 1,
         warmup_steps: int = 500,
@@ -174,8 +187,21 @@ class ModelTrainer:
         
         # Load tokenizer and model
         logger.info("Loading tokenizer and model...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(
+        # prajjwal1/bert-tiny has no tokenizer files — it shares bert-base-uncased vocab
+        TOKENIZER_OVERRIDES = {
+            "prajjwal1/bert-tiny":   "bert-base-uncased",
+            "prajjwal1/bert-mini":   "bert-base-uncased",
+            "prajjwal1/bert-small":  "bert-base-uncased",
+            "prajjwal1/bert-medium": "bert-base-uncased",
+        }
+        tokenizer_name = TOKENIZER_OVERRIDES.get(model_name, model_name)
+        if tokenizer_name != model_name:
+            logger.info(f"Using tokenizer '{tokenizer_name}' for model '{model_name}'")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        model_cls = MODEL_CLASS_OVERRIDES.get(model_name, AutoModelForSequenceClassification)
+        if model_cls is not AutoModelForSequenceClassification:
+            logger.info(f"Using explicit class '{model_cls.__name__}' for model '{model_name}'")
+        model = model_cls.from_pretrained(
             model_name,
             num_labels=data['num_classes'],
         ).to(self.device)
@@ -212,22 +238,26 @@ class ModelTrainer:
             save_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="f1",
+            save_total_limit=1,          # keep only the single best checkpoint → saves disk space
             logging_steps=max(1, len(train_dataset) // (batch_size * 4)),  # Log 4 times per epoch
             seed=42,
             report_to=[],  # Disable wandb/tensorboard logging
+            dataloader_pin_memory=torch.cuda.is_available(),  # only pin memory when a GPU is present
         )
         
-        # Prepare model for training with class weights if needed
+        # Prepare class weights tensor (map string class names → integer indices)
         if use_class_weights and class_weights:
-            class_weights_tensor = torch.tensor(
-                [class_weights.get(i, 1.0) for i in range(data['num_classes'])]
-            ).to(self.device)
+            le = data['label_encoder']
+            int_weights = [class_weights.get(le.classes_[i], 1.0) for i in range(data['num_classes'])]
+            class_weights_tensor = torch.tensor(int_weights).float().to(self.device)
             logger.info(f"Class weights tensor: {class_weights_tensor}")
         else:
             class_weights_tensor = None
-        
-        # Create trainer
-        trainer = Trainer(
+
+        # Create trainer (weighted/focal when applicable, standard otherwise)
+        use_custom_loss = class_weights_tensor is not None or use_focal_loss
+        trainer_cls = WeightedTrainer if use_custom_loss else Trainer
+        trainer_kwargs = dict(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -235,6 +265,12 @@ class ModelTrainer:
             compute_metrics=self._compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
         )
+        if use_custom_loss:
+            trainer_kwargs['class_weights_tensor'] = class_weights_tensor
+            trainer_kwargs['use_focal_loss'] = use_focal_loss
+            if use_focal_loss:
+                logger.info("Using focal loss (gamma=2.0) to handle class imbalance")
+        trainer = trainer_cls(**trainer_kwargs)
         
         # Train
         try:
@@ -247,8 +283,6 @@ class ModelTrainer:
         except Exception as e:
             logger.error(f"❌ Training failed: {str(e)}", exc_info=True)
             raise
-        
-        training_time = time.time() - start_time
         
         training_time = time.time() - start_time
         
@@ -288,6 +322,7 @@ class ModelTrainer:
         max_length: int,
         use_class_weights: bool = False,
         class_weights: Dict = None,
+        use_focal_loss: bool = False,
         experiment_name: str = "default",
     ) -> List[Dict]:
         """
@@ -310,7 +345,7 @@ class ModelTrainer:
         for model_name in model_names:
             # Try different hyperparameter combinations
             for num_epochs in hyperparams_ranges['num_epochs_range']:
-                for lr_scale in [0.5, 1.0]:  # Scale learning rate
+                for lr_scale in [1.0]:  # single learning rate per epoch configuration
                     
                     learning_rate = hyperparams_ranges['learning_rate'] * lr_scale
                     batch_size = hyperparams_ranges['batch_size']
@@ -330,6 +365,7 @@ class ModelTrainer:
                             max_length=max_length,
                             use_class_weights=use_class_weights,
                             class_weights=class_weights,
+                            use_focal_loss=use_focal_loss,
                             experiment_name=experiment_name,
                             gradient_accumulation_steps=gradient_accumulation_steps,
                             warmup_steps=warmup_steps,
@@ -343,7 +379,9 @@ class ModelTrainer:
                         logger.error(f"Error training {model_name} with epochs={num_epochs}: {str(e)}")
                         continue
                 
-                # For MVP, only train one model variant per model name
+                # Only train the first (minimum) epoch value per model.
+                # The upper bound of num_epochs_range is reserved for future
+                # multi-epoch grid search; break keeps current single-variant behaviour.
                 break
         
         return all_results

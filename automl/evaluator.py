@@ -7,7 +7,7 @@ import torch
 import pandas as pd
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -21,39 +21,10 @@ import time
 from typing import Dict, List, Tuple
 from pathlib import Path
 
+from automl.dataset import TextDataset  # shared dataset
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class TextDataset(Dataset):
-    """PyTorch Dataset for text classification"""
-    
-    def __init__(self, texts: List[str], labels: List[int], tokenizer, max_length: int):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)
-        }
 
 
 class ModelEvaluator:
@@ -71,6 +42,7 @@ class ModelEvaluator:
         max_length: int,
         batch_size: int = 32,
         label_encoder = None,
+        split: str = 'val',
     ) -> Dict:
         """
         Evaluate a single model
@@ -88,7 +60,14 @@ class ModelEvaluator:
             Dictionary with evaluation metrics
         """
         logger.info(f"Evaluating model from {model_path}")
-        
+
+        # Guard against a missing or empty model directory (e.g. disk-full during training)
+        model_dir = Path(model_path)
+        if not model_dir.exists():
+            raise ValueError(f"Model path does not exist: {model_path}")
+        if not any(model_dir.iterdir()):
+            raise ValueError(f"Model path is empty (training may have failed to save): {model_path}")
+
         # Load model
         model = AutoModelForSequenceClassification.from_pretrained(model_path).to(self.device)
         model.eval()
@@ -125,13 +104,24 @@ class ModelEvaluator:
         
         # Calculate metrics
         accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='weighted')
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
         precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
         recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-        
-        avg_inference_time = np.mean(inference_times)
+
+        # Weighted mean: weight each batch by its actual sample count to avoid
+        # the final (smaller) batch skewing the per-sample latency estimate
+        total_samples = len(all_preds)
+        # Recompute from loader length (batch records were appended per-batch)
+        batch_cursor = 0
+        weighted_latency_sum = 0.0
+        for i, t in enumerate(inference_times):
+            bs = batch_size if (batch_cursor + batch_size) <= total_samples else (total_samples - batch_cursor)
+            weighted_latency_sum += t * bs
+            batch_cursor += bs
+        avg_inference_time = weighted_latency_sum / total_samples if total_samples > 0 else 0.0
         
         results = {
+            'split': split,
             'accuracy': accuracy,
             'f1_score': f1,
             'precision': precision,
@@ -144,7 +134,13 @@ class ModelEvaluator:
         
         logger.info(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
         logger.info(f"Avg inference time: {avg_inference_time*1000:.2f}ms per sample")
-        
+
+        # Free model memory immediately — each call loads a fresh model instance and
+        # keeping them alive causes GPU OOM when evaluating multiple models in sequence.
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return results
     
     def compare_models(self, results_list: List[Dict]) -> Dict:
@@ -225,47 +221,94 @@ class ModelEvaluator:
         self,
         best_model_result: Dict,
         label_encoder,
-        output_path: str = "experiments/best_model_report.txt"
+        output_path: str = "experiments/best_model_report.txt",
+        train_result: Dict = None,
     ) -> None:
         """
-        Generate evaluation report
-        
+        Generate evaluation report with optional train vs val comparison.
+
         Args:
-            best_model_result: Best model evaluation result
+            best_model_result: Validation evaluation result (the best model)
             label_encoder: Label encoder for class names
             output_path: Where to save report
+            train_result: Training set evaluation result (optional, for overfitting analysis)
         """
         logger.info(f"Generating report to {output_path}")
-        
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_path, 'w') as f:
+
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
             f.write("BEST MODEL EVALUATION REPORT\n")
             f.write("="*70 + "\n\n")
-            
+
             f.write(f"Model: {best_model_result.get('model_name', 'Unknown')}\n\n")
-            
-            f.write("METRICS:\n")
-            f.write(f"  F1 Score: {best_model_result['f1_score']:.4f}\n")
-            f.write(f"  Accuracy: {best_model_result['accuracy']:.4f}\n")
-            f.write(f"  Precision: {best_model_result['precision']:.4f}\n")
-            f.write(f"  Recall: {best_model_result['recall']:.4f}\n")
-            f.write(f"  Avg Latency: {best_model_result['avg_inference_time_ms']:.2f}ms per sample\n\n")
-            
-            # Classification report
-            f.write("CLASSIFICATION REPORT:\n")
-            class_report = classification_report(
+
+            # ── Side-by-side train vs val metrics ─────────────────────────────
+            if train_result is not None:
+                f.write("="*70 + "\n")
+                f.write("TRAIN vs VALIDATION METRICS (overfitting check)\n")
+                f.write("="*70 + "\n")
+                f.write(f"{'Metric':<20} {'Train':>10} {'Validation':>12} {'Gap':>8}\n")
+                f.write("-"*54 + "\n")
+
+                metrics = [
+                    ('F1 Score',  train_result['f1_score'],  best_model_result['f1_score']),
+                    ('Accuracy',  train_result['accuracy'],  best_model_result['accuracy']),
+                    ('Precision', train_result['precision'], best_model_result['precision']),
+                    ('Recall',    train_result['recall'],    best_model_result['recall']),
+                ]
+                for name, tr, vl in metrics:
+                    gap = tr - vl
+                    flag = '  ⚠️ overfit' if gap > 0.05 else ('  ✅' if abs(gap) <= 0.05 else '  📉 underfit')
+                    f.write(f"{name:<20} {tr:>10.4f} {vl:>12.4f} {gap:>+8.4f}{flag}\n")
+
+                f.write("\n")
+                # Diagnosis
+                avg_gap = train_result['f1_score'] - best_model_result['f1_score']
+                if avg_gap > 0.10:
+                    diagnosis = "HIGH OVERFITTING — model memorised training data. Consider more regularisation, dropout, or more data."
+                elif avg_gap > 0.05:
+                    diagnosis = "MILD OVERFITTING — slight gap. Monitor and consider early stopping or weight decay."
+                elif avg_gap < -0.05:
+                    diagnosis = "UNDERFITTING — val F1 > train F1. Model may not have converged. Try more epochs or a lower LR."
+                else:
+                    diagnosis = "GOOD FIT — train and val metrics are close. Model generalises well."
+                f.write(f"Diagnosis: {diagnosis}\n\n")
+            else:
+                f.write("VALIDATION METRICS:\n")
+                f.write(f"  F1 Score:  {best_model_result['f1_score']:.4f}\n")
+                f.write(f"  Accuracy:  {best_model_result['accuracy']:.4f}\n")
+                f.write(f"  Precision: {best_model_result['precision']:.4f}\n")
+                f.write(f"  Recall:    {best_model_result['recall']:.4f}\n")
+                f.write(f"  Avg Latency: {best_model_result['avg_inference_time_ms']:.2f}ms per sample\n\n")
+
+            # ── Validation classification report ──────────────────────────────
+            f.write("VALIDATION CLASSIFICATION REPORT:\n")
+            val_class_report = classification_report(
                 best_model_result['true_labels'],
                 best_model_result['predictions'],
                 target_names=label_encoder.classes_,
                 zero_division=0
             )
-            f.write(class_report + "\n\n")
-            
-            # Confusion matrix
-            f.write("CONFUSION MATRIX:\n")
-            cm = best_model_result['confusion_matrix']
-            f.write(str(cm) + "\n")
-        
+            f.write(val_class_report + "\n")
+
+            f.write("VALIDATION CONFUSION MATRIX:\n")
+            f.write(str(best_model_result['confusion_matrix']) + "\n")
+
+            # ── Training classification report (if available) ─────────────────
+            if train_result is not None:
+                f.write("\n" + "="*70 + "\n")
+                f.write("TRAINING CLASSIFICATION REPORT:\n")
+                train_class_report = classification_report(
+                    train_result['true_labels'],
+                    train_result['predictions'],
+                    target_names=label_encoder.classes_,
+                    zero_division=0
+                )
+                f.write(train_class_report + "\n")
+
+                f.write("TRAINING CONFUSION MATRIX:\n")
+                f.write(str(train_result['confusion_matrix']) + "\n")
+
         logger.info(f"Report saved to {output_path}")

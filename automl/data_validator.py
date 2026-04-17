@@ -48,7 +48,11 @@ class DataValidator:
         # Load CSV
         logger.info(f"Loading CSV from {csv_path}")
         try:
-            df = pd.read_csv(csv_path)
+            try:
+                df = pd.read_csv(csv_path, encoding='utf-8')
+            except UnicodeDecodeError:
+                logger.warning("UTF-8 decode failed, retrying with latin-1 encoding")
+                df = pd.read_csv(csv_path, encoding='latin-1')
         except Exception as e:
             raise ValueError(f"Failed to load CSV: {str(e)}")
         
@@ -61,6 +65,30 @@ class DataValidator:
         # Validate label column exists
         if label_column not in df.columns:
             raise ValueError(f"Label column '{label_column}' not found in CSV")
+
+        # Normalise label column dtype:
+        # - Float labels (1.0, 2.0) that are actually integer class IDs → "1", "2"
+        #   so they don't get encoded as different classes from "1" / "2" string datasets.
+        # - Int labels (0, 1, 2) → "0", "1", "2" (string) for consistent LabelEncoder behaviour.
+        if pd.api.types.is_float_dtype(df[label_column]):
+            non_null = df[label_column].dropna()
+            if not non_null.empty and (non_null == non_null.astype(int)).all():
+                # Convert the FULL column so NaN rows keep NaN and valid rows become strings.
+                # Using .where() preserves NaN positions; the NaN rows are dropped later.
+                df[label_column] = df[label_column].where(
+                    df[label_column].isna(),
+                    df[label_column].fillna(0).astype(int).astype(str)
+                )
+                logger.info(
+                    f"Label column '{label_column}': converted float values to integer strings "
+                    f"(e.g. 1.0 → '1') for consistent encoding."
+                )
+        elif pd.api.types.is_integer_dtype(df[label_column]):
+            df[label_column] = df[label_column].astype(str)
+            logger.info(
+                f"Label column '{label_column}': converted integer values to strings "
+                f"for consistent encoding."
+            )
         
         # Auto-detect text column if not provided
         if text_column is None:
@@ -84,13 +112,45 @@ class DataValidator:
         
         if len(df) < self.min_samples:
             raise ValueError(f"After removing NaN values, only {len(df)} samples remain")
-        
+
+        # Drop whitespace-only texts (they tokenize to just [CLS][SEP] and add noise)
+        whitespace_mask = df[text_column].astype(str).str.strip() == ""
+        whitespace_count = int(whitespace_mask.sum())
+        if whitespace_count > 0:
+            logger.warning(
+                f"Dropping {whitespace_count} rows whose text column is whitespace-only "
+                f"(they would tokenize to empty sequences)"
+            )
+            df = df[~whitespace_mask]
+
+        if len(df) < self.min_samples:
+            raise ValueError(
+                f"After removing whitespace-only texts, only {len(df)} samples remain"
+            )
+
         # Remove duplicates
         initial_len = len(df)
         df = df.drop_duplicates(subset=[text_column])
         duplicates_removed = initial_len - len(df)
         if duplicates_removed > 0:
             logger.info(f"Removed {duplicates_removed} duplicate samples ({100*duplicates_removed/initial_len:.2f}%)")
+
+        # Guard: need at least 2 classes to do classification
+        num_classes = df[label_column].nunique()
+        if num_classes < 2:
+            raise ValueError(
+                f"Label column '{label_column}' contains only 1 unique class. "
+                f"Classification requires at least 2 classes."
+            )
+
+        # After deduplication, verify each class still has enough samples for a stratified split
+        min_class_count = df[label_column].value_counts().min()
+        if min_class_count < 2:
+            raise ValueError(
+                f"After deduplication, at least one class has only {min_class_count} sample(s). "
+                f"Stratified train/val split requires at least 2 samples per class. "
+                f"Please collect more data or reduce the number of classes."
+            )
         
         # Validate text column is string type
         df[text_column] = df[text_column].astype(str)
@@ -117,27 +177,72 @@ class DataValidator:
             - column_stats: dict with stats for each column
         """
         text_columns_info = []
-        
+
         for col in df.columns:
-            if col != label_column and df[col].dtype == 'object':
-                try:
-                    text_series = df[col].astype(str)
-                    avg_len = text_series.str.len().mean()
-                    
-                    # Consider it a text column if avg length > 10
-                    if avg_len > 10:
-                        text_columns_info.append({
-                            'name': col,
-                            'avg_length': avg_len,
-                            'min_length': text_series.str.len().min(),
-                            'max_length': text_series.str.len().max(),
-                            'non_null_count': text_series.notna().sum(),
-                        })
-                except:
-                    pass
-        
+            if col == label_column:
+                continue
+            # Try ALL columns regardless of dtype — cast to str to measure text length.
+            # This handles columns stored as int/float that actually contain text IDs or
+            # short category strings (e.g. a text column accidentally inferred as numeric).
+            try:
+                text_series = df[col].astype(str)
+                avg_len = text_series.str.len().mean()
+
+                # Primary threshold: avg length > 10 chars indicates real text content
+                if avg_len > 10:
+                    # Warn if > 50% of rows share the same value (near-constant column)
+                    top_freq = text_series.value_counts(normalize=True).iloc[0]
+                    if top_freq > 0.5:
+                        logger.warning(
+                            f"Column '{col}' has {top_freq*100:.0f}% of rows with the same "
+                            f"value — likely a near-constant column. It will be included but "
+                            f"may not carry useful signal."
+                        )
+                    text_columns_info.append({
+                        'name': col,
+                        'avg_length': avg_len,
+                        'min_length': text_series.str.len().min(),
+                        'max_length': text_series.str.len().max(),
+                        'non_null_count': text_series.notna().sum(),
+                    })
+            except Exception:
+                logger.warning(f"Could not analyse column '{col}' for text detection, skipping")
+
+        # Fallback: if no column cleared the avg_length > 10 bar, pick the column with the
+        # highest average length among all non-label columns.  This handles datasets where
+        # all texts happen to be very short (e.g. single-word labels in the wrong column).
         if not text_columns_info:
-            raise ValueError("Could not find any text columns (need object dtype with avg length > 10)")
+            best_col, best_avg = None, 0.0
+            for col in df.columns:
+                if col == label_column:
+                    continue
+                try:
+                    avg_len = float(df[col].astype(str).str.len().mean())
+                    if avg_len > best_avg:
+                        best_avg = avg_len
+                        best_col = col
+                except Exception:
+                    pass
+            if best_col is not None:
+                logger.warning(
+                    f"No column has avg text length > 10. "
+                    f"Falling back to '{best_col}' (avg {best_avg:.1f} chars) as the text column. "
+                    f"Verify this is the correct column."
+                )
+                text_series = df[best_col].astype(str)
+                text_columns_info.append({
+                    'name': best_col,
+                    'avg_length': best_avg,
+                    'min_length': text_series.str.len().min(),
+                    'max_length': text_series.str.len().max(),
+                    'non_null_count': text_series.notna().sum(),
+                })
+            else:
+                raise ValueError(
+                    f"Could not find any text column. The dataset has only the label column '{label_column}'. "
+                    f"Please provide a CSV with at least one text/feature column."
+                )
+
         
         # Sort by average length (descending)
         text_columns_info.sort(key=lambda x: x['avg_length'], reverse=True)
@@ -204,7 +309,7 @@ class DataValidator:
         # Load tokenizer for token counting
         try:
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        except:
+        except Exception:
             logger.warning(f"Could not load tokenizer {tokenizer_name}, using approximate token counting")
             tokenizer = None
         
@@ -252,12 +357,18 @@ class DataValidator:
             
             def smart_truncate(text):
                 """Truncate while preserving main content"""
-                tokens = tokenizer.encode(text, truncation=False) if tokenizer else None
-                
-                if tokenizer and len(tokens) > max_tokens:
-                    # Keep first 80% of tokens for primary content
-                    # Truncate secondary content
-                    truncated = tokenizer.decode(tokens[:int(max_tokens * 0.8)])
+                if tokenizer is None:
+                    # Fallback: rough char-based truncation (≈4 chars per token),
+                    # keeping 80% of the limit to match the tokenizer-based path.
+                    _KEEP_RATIO = 0.8
+                    max_chars = int(max_tokens * 4 * _KEEP_RATIO)
+                    return text[:max_chars] if len(text) > max_chars else text
+
+                tokens = tokenizer.encode(text, truncation=False)
+                if len(tokens) > max_tokens:
+        # Keep first 80% of tokens to preserve primary content over secondary
+                    _KEEP_RATIO = 0.8
+                    truncated = tokenizer.decode(tokens[:int(max_tokens * _KEEP_RATIO)])
                     return truncated
                 return text
             

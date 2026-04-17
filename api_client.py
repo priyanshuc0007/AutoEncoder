@@ -232,12 +232,16 @@ def main():
         print("="*70 + "\n")
         
         best_model = results.get('best_model', {})
-        metrics = best_model.get('metrics', {})
+        metrics = best_model.get('metrics', {}) or {}
         
+        f1 = metrics.get('f1_score')
+        acc = metrics.get('accuracy')
+        lat = metrics.get('latency_ms')
+
         print(f"Best Model: {best_model.get('name')}")
-        print(f"F1 Score: {metrics.get('f1_score'):.4f}")
-        print(f"Accuracy: {metrics.get('accuracy'):.4f}")
-        print(f"Latency: {metrics.get('latency_ms'):.2f}ms\n")
+        print(f"F1 Score: {f1:.4f}" if f1 is not None else "F1 Score: N/A")
+        print(f"Accuracy: {acc:.4f}" if acc is not None else "Accuracy: N/A")
+        print(f"Latency: {lat:.2f}ms\n" if lat is not None else "Latency: N/A\n")
         
         # Get report
         print("5️⃣  Downloading experiment report...")
