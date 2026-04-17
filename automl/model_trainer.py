@@ -10,10 +10,19 @@ import numpy as np
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
+    BertForSequenceClassification,
     TrainingArguments,
     Trainer,
     EarlyStoppingCallback,
 )
+
+# Models that don't declare model_type in their config.json and need an explicit class
+MODEL_CLASS_OVERRIDES = {
+    "prajjwal1/bert-tiny":   BertForSequenceClassification,
+    "prajjwal1/bert-mini":   BertForSequenceClassification,
+    "prajjwal1/bert-small":  BertForSequenceClassification,
+    "prajjwal1/bert-medium": BertForSequenceClassification,
+}
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
@@ -29,18 +38,34 @@ logger = logging.getLogger(__name__)
 
 
 class WeightedTrainer(Trainer):
-    """Trainer subclass that applies per-class weights to the cross-entropy loss."""
+    """Trainer subclass that applies per-class weights and optional focal loss."""
 
-    def __init__(self, class_weights_tensor=None, **kwargs):
+    def __init__(self, class_weights_tensor=None, use_focal_loss: bool = False, focal_gamma: float = 2.0, **kwargs):
         super().__init__(**kwargs)
         self.class_weights_tensor = class_weights_tensor
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
-        loss_fn = nn.CrossEntropyLoss(weight=self.class_weights_tensor)
-        loss = loss_fn(logits, labels)
+
+        if self.use_focal_loss:
+            # Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+            # alpha_t is handled via class_weights_tensor (if provided)
+            ce_loss = nn.CrossEntropyLoss(
+                weight=self.class_weights_tensor, reduction='none'
+            )(logits, labels)
+            probs = torch.softmax(logits, dim=1)
+            # p_t: probability assigned to the correct class
+            p_t = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma
+            loss = (focal_weight * ce_loss).mean()
+        else:
+            loss_fn = nn.CrossEntropyLoss(weight=self.class_weights_tensor)
+            loss = loss_fn(logits, labels)
+
         return (loss, outputs) if return_outputs else loss
 
 
@@ -119,6 +144,7 @@ class ModelTrainer:
         max_length: int,
         use_class_weights: bool = False,
         class_weights: Dict = None,
+        use_focal_loss: bool = False,
         experiment_name: str = "default",
         gradient_accumulation_steps: int = 1,
         warmup_steps: int = 500,
@@ -161,8 +187,21 @@ class ModelTrainer:
         
         # Load tokenizer and model
         logger.info("Loading tokenizer and model...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(
+        # prajjwal1/bert-tiny has no tokenizer files — it shares bert-base-uncased vocab
+        TOKENIZER_OVERRIDES = {
+            "prajjwal1/bert-tiny":   "bert-base-uncased",
+            "prajjwal1/bert-mini":   "bert-base-uncased",
+            "prajjwal1/bert-small":  "bert-base-uncased",
+            "prajjwal1/bert-medium": "bert-base-uncased",
+        }
+        tokenizer_name = TOKENIZER_OVERRIDES.get(model_name, model_name)
+        if tokenizer_name != model_name:
+            logger.info(f"Using tokenizer '{tokenizer_name}' for model '{model_name}'")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        model_cls = MODEL_CLASS_OVERRIDES.get(model_name, AutoModelForSequenceClassification)
+        if model_cls is not AutoModelForSequenceClassification:
+            logger.info(f"Using explicit class '{model_cls.__name__}' for model '{model_name}'")
+        model = model_cls.from_pretrained(
             model_name,
             num_labels=data['num_classes'],
         ).to(self.device)
@@ -199,9 +238,11 @@ class ModelTrainer:
             save_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="f1",
+            save_total_limit=1,          # keep only the single best checkpoint → saves disk space
             logging_steps=max(1, len(train_dataset) // (batch_size * 4)),  # Log 4 times per epoch
             seed=42,
             report_to=[],  # Disable wandb/tensorboard logging
+            dataloader_pin_memory=torch.cuda.is_available(),  # only pin memory when a GPU is present
         )
         
         # Prepare class weights tensor (map string class names → integer indices)
@@ -212,9 +253,10 @@ class ModelTrainer:
             logger.info(f"Class weights tensor: {class_weights_tensor}")
         else:
             class_weights_tensor = None
-        
-        # Create trainer (weighted when class weights are available, standard otherwise)
-        trainer_cls = WeightedTrainer if class_weights_tensor is not None else Trainer
+
+        # Create trainer (weighted/focal when applicable, standard otherwise)
+        use_custom_loss = class_weights_tensor is not None or use_focal_loss
+        trainer_cls = WeightedTrainer if use_custom_loss else Trainer
         trainer_kwargs = dict(
             model=model,
             args=training_args,
@@ -223,8 +265,11 @@ class ModelTrainer:
             compute_metrics=self._compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
         )
-        if class_weights_tensor is not None:
+        if use_custom_loss:
             trainer_kwargs['class_weights_tensor'] = class_weights_tensor
+            trainer_kwargs['use_focal_loss'] = use_focal_loss
+            if use_focal_loss:
+                logger.info("Using focal loss (gamma=2.0) to handle class imbalance")
         trainer = trainer_cls(**trainer_kwargs)
         
         # Train
@@ -277,6 +322,7 @@ class ModelTrainer:
         max_length: int,
         use_class_weights: bool = False,
         class_weights: Dict = None,
+        use_focal_loss: bool = False,
         experiment_name: str = "default",
     ) -> List[Dict]:
         """
@@ -319,6 +365,7 @@ class ModelTrainer:
                             max_length=max_length,
                             use_class_weights=use_class_weights,
                             class_weights=class_weights,
+                            use_focal_loss=use_focal_loss,
                             experiment_name=experiment_name,
                             gradient_accumulation_steps=gradient_accumulation_steps,
                             warmup_steps=warmup_steps,
@@ -332,7 +379,9 @@ class ModelTrainer:
                         logger.error(f"Error training {model_name} with epochs={num_epochs}: {str(e)}")
                         continue
                 
-                # For MVP, only train one model variant per model name
+                # Only train the first (minimum) epoch value per model.
+                # The upper bound of num_epochs_range is reserved for future
+                # multi-epoch grid search; break keeps current single-variant behaviour.
                 break
         
         return all_results

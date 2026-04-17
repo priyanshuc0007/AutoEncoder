@@ -98,29 +98,107 @@ def display_data_preview(df, label_col, text_col):
 def display_pipeline_results(result):
     """Display pipeline results"""
     st.success("✅ Pipeline Completed Successfully!")
-    
-    # Key metrics
+
+    # ── Best model headline ──────────────────────────────────────────────────
     st.subheader("🏆 Best Model Results")
-    
     metrics = result.get('best_model_metrics', {})
-    
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Model", result.get('best_model_name', 'Unknown')[:25])
+        st.metric("Model", result.get('best_model_name', 'Unknown')[:30])
     with col2:
         st.metric("F1 Score", f"{metrics.get('f1_score', 0):.4f}")
     with col3:
         st.metric("Accuracy", f"{metrics.get('accuracy', 0):.4f}")
     with col4:
         st.metric("Latency (ms)", f"{metrics.get('latency_ms', 0):.2f}")
-    
-    # Model comparison
+
+    # ── Full model comparison ────────────────────────────────────────────────
     st.subheader("📊 Model Comparison")
     comparison_df = result.get('comparison_df')
-    if comparison_df is not None:
-        st.dataframe(comparison_df, width='stretch')
-    
-    # Experiment info
+
+    if comparison_df is not None and not comparison_df.empty:
+        n_models = len(comparison_df)
+        best_name = result.get('best_model_name', '')
+
+        # ── Styled table ────────────────────────────────────────────────────
+        def _highlight_best(row):
+            """Highlight the winning model row in green."""
+            is_best = str(row.get('Model', '')) == str(best_name)
+            bg = 'background-color: #1a4a2a; color: #06D6A0; font-weight: bold' if is_best else ''
+            return [bg] * len(row)
+
+        display_cols = [c for c in [
+            'Model', 'F1 Score', 'Accuracy', 'Precision', 'Recall',
+            'Latency (ms)', 'Composite Score'
+        ] if c in comparison_df.columns]
+
+        styled = (
+            comparison_df[display_cols]
+            .style
+            .apply(_highlight_best, axis=1)
+            .format({
+                'F1 Score': '{:.4f}',
+                'Accuracy': '{:.4f}',
+                'Precision': '{:.4f}',
+                'Recall': '{:.4f}',
+                'Latency (ms)': '{:.2f}',
+                'Composite Score': '{:.4f}',
+            })
+        )
+        st.dataframe(styled, width='stretch')
+
+        # ── Charts (only useful when more than 1 model) ──────────────────────
+        if n_models > 1:
+            st.markdown("#### Visual Comparison")
+
+            chart_col1, chart_col2 = st.columns(2)
+
+            with chart_col1:
+                # F1 / Accuracy / Composite bar chart
+                bar_data = comparison_df.set_index('Model')[
+                    [c for c in ['F1 Score', 'Accuracy', 'Composite Score']
+                     if c in comparison_df.columns]
+                ]
+                st.markdown("**Performance Metrics**")
+                st.bar_chart(bar_data)
+
+            with chart_col2:
+                # Latency bar chart (lower = better)
+                if 'Latency (ms)' in comparison_df.columns:
+                    lat_data = comparison_df.set_index('Model')[['Latency (ms)']]
+                    st.markdown("**Inference Latency (ms) — lower is better**")
+                    st.bar_chart(lat_data)
+
+            # Detailed per-model cards
+            st.markdown("#### Per-Model Detail")
+            card_cols = st.columns(n_models)
+            for i, (_, row) in enumerate(comparison_df.iterrows()):
+                model_name = str(row.get('Model', 'Model'))
+                is_best = model_name == str(best_name)
+                with card_cols[i]:
+                    header = f"🏆 {model_name}" if is_best else f"🔹 {model_name}"
+                    st.markdown(f"**{header}**")
+                    if is_best:
+                        st.success("Best model")
+                    for col_name in ['F1 Score', 'Accuracy', 'Precision',
+                                     'Recall', 'Latency (ms)', 'Composite Score']:
+                        if col_name in row:
+                            val = row[col_name]
+                            try:
+                                fmt = f"{val:.4f}" if col_name != 'Latency (ms)' else f"{val:.2f} ms"
+                            except (TypeError, ValueError):
+                                fmt = str(val) if val is not None else 'N/A'
+                            st.write(f"- **{col_name}**: {fmt}")
+        else:
+            st.info(
+                "Only one model result is stored for this experiment. "
+                "This happens when the experiment was run before multi-model support was added. "
+                "Re-run the pipeline to get a full comparison between **bert-tiny** and **DistilBERT**."
+            )
+    else:
+        st.warning("No comparison data available.")
+
+    # ── Experiment info ──────────────────────────────────────────────────────
     st.subheader("ℹ️ Experiment Information")
     col1, col2 = st.columns(2)
     with col1:
@@ -128,39 +206,206 @@ def display_pipeline_results(result):
         st.write(f"**Model Path**: `{result.get('best_model_path')}`")
     with col2:
         st.write(f"**Output Directory**: `{result.get('experiment_dir')}`")
-        
-        # Download best model button
-        if os.path.exists(result.get('experiment_dir')):
+        if os.path.exists(result.get('experiment_dir', '')):
             st.info("🔍 Model files are saved to the experiment directory")
-    
-    # Data analysis
+
+    # ── Data intelligence report ─────────────────────────────────────────────
     st.subheader("🧠 Data Intelligence Report")
     analysis = result.get('data_analysis', {})
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.write("**Task Information**")
         task_info = analysis.get('task_info', {})
         st.write(f"- Task Type: **{task_info.get('task_type', 'N/A').upper()}**")
         st.write(f"- Number of Classes: **{task_info.get('num_classes', 'N/A')}**")
-        
+
         st.write("\n**Imbalance Information**")
         imbal = analysis.get('imbalance_info', {})
-        st.write(f"- Imbalance Ratio: **{imbal.get('imbalance_ratio', 'N/A'):.2f}**")
+        imbalance_ratio = imbal.get('imbalance_ratio')
+        st.write(f"- Imbalance Ratio: **{imbalance_ratio:.2f}**" if isinstance(imbalance_ratio, (int, float)) else "- Imbalance Ratio: **N/A**")
         st.write(f"- Use Class Weights: **{'✓ YES' if imbal.get('use_class_weights') else '✗ NO'}**")
         st.write(f"- Use Focal Loss: **{'✓ YES' if imbal.get('use_focal_loss') else '✗ NO'}**")
-    
+
     with col2:
         st.write("**Text Information**")
         text_info = analysis.get('text_info', {})
-        st.write(f"- Average Length: **{text_info.get('avg_length', 'N/A'):.0f}**")
+        avg_length = text_info.get('avg_length')
+        st.write(f"- Average Length: **{avg_length:.0f}**" if isinstance(avg_length, (int, float)) else "- Average Length: **N/A**")
         st.write(f"- Max Length (95%): **{text_info.get('p95_length', 'N/A')}**")
-        
+
         st.write("\n**Training Configuration**")
         config = analysis.get('training_config', {})
         st.write(f"- Batch Size: **{config.get('batch_size', 'N/A')}**")
         st.write(f"- Learning Rate: **{config.get('learning_rate', 'N/A')}**")
+
+    # ── Explainability & Reliability ─────────────────────────────────────────
+    st.subheader("🔍 Explainability & Reliability")
+
+    expl = result.get('explainability') or {}
+    conf_stats = expl.get('confidence_stats') or {}
+    token_expl = expl.get('token_explanations') or []
+
+    # Fallback: read the .txt report if structured data is missing (e.g. older run)
+    if not conf_stats and not token_expl:
+        exp_dir = result.get('experiment_dir', '')
+        report_path = os.path.join(exp_dir, 'explainability_report.txt')
+        if os.path.exists(report_path):
+            with open(report_path, 'r', encoding='utf-8') as _f:
+                st.text(_f.read())
+        else:
+            st.info("No explainability data available. Re-run the pipeline to generate it.")
+    else:
+        # ── Confidence headline metrics ──────────────────────────────────────
+        ece = conf_stats.get('ece')
+        mean_conf = conf_stats.get('mean_confidence')
+        low_count = conf_stats.get('low_confidence_count', 0)
+        low_pct = conf_stats.get('low_confidence_pct', 0.0)
+        threshold = conf_stats.get('low_confidence_threshold', 0.80)
+
+        if ece is not None:
+            if ece < 0.05:
+                cal_label = "Well calibrated ✅"
+                cal_delta_color = "normal"
+                cal_explanation = (
+                    "The model's stated confidence closely matches its actual accuracy. "
+                    "When it says 80% sure, it's right ~80% of the time."
+                )
+            elif ece < 0.10:
+                cal_label = "Acceptable calibration ⚠️"
+                cal_delta_color = "off"
+                cal_explanation = (
+                    "Minor gap between stated confidence and actual accuracy — "
+                    "generally fine for most use cases."
+                )
+            elif isinstance(mean_conf, float) and mean_conf < 0.80:
+                # Under-confident: model predicts correctly but softmax scores are low
+                cal_label = "Under-confident ⚠️"
+                cal_delta_color = "off"
+                cal_explanation = (
+                    "**The model's predictions are correct, but it isn't sure of itself.** "
+                    "It says things like '73% spam' instead of '97% spam'. "
+                    "This is the *safer* miscalibration — predictions are trustworthy, "
+                    "the confidence scores just understate how reliable the model is. "
+                    "Common after fine-tuning on small datasets."
+                )
+            else:
+                cal_label = "Over-confident ❌"
+                cal_delta_color = "inverse"
+                cal_explanation = (
+                    "The model claims high confidence on predictions it gets wrong. "
+                    "Treat its probability scores with caution."
+                )
+        else:
+            cal_label = "N/A"
+            cal_delta_color = "off"
+            cal_explanation = ""
+
+        ec1, ec2, ec3 = st.columns(3)
+        with ec1:
+            st.metric(
+                "ECE (Calibration)",
+                f"{ece:.4f}" if isinstance(ece, float) else "N/A",
+                delta=cal_label,
+                delta_color=cal_delta_color,
+                help=(
+                    "Expected Calibration Error — measures how well the model's "
+                    "confidence scores match its actual accuracy. "
+                    "0 = perfect, 1 = completely wrong. "
+                    "Below 0.05 is excellent, below 0.10 is acceptable."
+                ),
+            )
+        with ec2:
+            st.metric(
+                "Mean Confidence",
+                f"{mean_conf:.4f}" if isinstance(mean_conf, float) else "N/A",
+                help=(
+                    "Average softmax probability the model assigned to its "
+                    "chosen class across the whole validation set. "
+                    "0.73 means the model said 'I'm 73% sure' on average."
+                ),
+            )
+        with ec3:
+            st.metric(
+                f"Low-Conf Samples (<{threshold})",
+                f"{low_count} ({low_pct:.1f}%)",
+                help=(
+                    f"Samples where the model's confidence was below {threshold}. "
+                    "High counts here don't mean wrong predictions — just that "
+                    "the model is uncertain. Check Token Importance below for these cases."
+                ),
+            )
+
+        if cal_explanation:
+            st.info(f"**What this means:** {cal_explanation}")
+
+        # ── Confidence distribution bar chart ────────────────────────────────
+        hist = conf_stats.get('confidence_histogram', [])
+        if hist:
+            hist_df = pd.DataFrame(hist).set_index('range').rename(
+                columns={'count': 'Samples'}
+            )
+            st.markdown(
+                "**Confidence Distribution** — how many samples fell into each probability bucket"
+            )
+            st.caption(
+                "Ideal: most samples in 0.9–1.0. "
+                "All bars in 0.6–0.8 = under-confident (correct but not bold). "
+                "Bars spread across 0.5–0.7 on wrong predictions = over-confident."
+            )
+            st.bar_chart(hist_df)
+
+        # ── Calibration table ────────────────────────────────────────────────
+        cal_bins = conf_stats.get('calibration_bins', [])
+        if cal_bins:
+            with st.expander("📐 Calibration Detail (ECE bins)"):
+                cal_df = pd.DataFrame(cal_bins)
+                cal_df.columns = [c.replace('_', ' ').title() for c in cal_df.columns]
+                st.dataframe(cal_df, use_container_width=True)
+
+        # ── Token importance samples ─────────────────────────────────────────
+        if token_expl:
+            st.markdown("**Token Importance** — which words most influenced each prediction")
+            st.caption(
+                "Scores use attention rollout (1 forward pass) with gradient "
+                "saliency fallback. Both are fast and model-agnostic."
+            )
+            for i, sample in enumerate(token_expl):
+                correct = sample.get('correct', False)
+                badge = "✅ Correct" if correct else "❌ Wrong"
+                pred = sample.get('predicted', '?')
+                actual = sample.get('actual', '?')
+                with st.expander(f"Sample {i+1} — predicted: **{pred}** | actual: **{actual}** | {badge}"):
+                    st.write(f"**Text:** {sample.get('text', '')}")
+                    top_words = sample.get('top_words', [])
+                    if top_words:
+                        # Normalise scores to [0,1] for progress bars
+                        max_score = max(sc for _, sc in top_words) or 1.0
+                        for word, score in top_words:
+                            col_w, col_b = st.columns([1, 4])
+                            with col_w:
+                                st.write(f"`{word}`")
+                            with col_b:
+                                st.progress(min(1.0, float(score / max_score)))
+                    all_words = sample.get('word_scores', [])
+                    if len(all_words) > len(top_words):
+                        with st.expander("See all word scores"):
+                            max_all = max(sc for _, sc in all_words) or 1.0
+                            for word, score in all_words:
+                                col_w, col_b = st.columns([1, 4])
+                                with col_w:
+                                    st.write(f"`{word}`")
+                                with col_b:
+                                    st.progress(min(1.0, float(score / max_all)))
+
+        # ── Raw report fallback ──────────────────────────────────────────────
+        exp_dir = result.get('experiment_dir', '')
+        report_path = os.path.join(exp_dir, 'explainability_report.txt')
+        if os.path.exists(report_path):
+            with st.expander("📄 View Full Explainability Report (text)"):
+                with open(report_path, 'r', encoding='utf-8') as _f:
+                    st.text(_f.read())
 
 
 # Main app
@@ -311,13 +556,13 @@ with tab1:
                     # Store results
                     st.session_state.pipeline_results = result
                     st.session_state.current_experiment = result
-                    
+
                     # Save to history
                     if result.get('status') == 'success':
                         save_experiment_to_history(result)
-                    
-                    # Display results
-                    display_pipeline_results(result)
+                        display_pipeline_results(result)
+                    else:
+                        st.error(f"❌ Pipeline failed: {result.get('error', 'Unknown error')}")
                     
                 except Exception as e:
                     st.error(f"❌ Pipeline failed: {str(e)}")

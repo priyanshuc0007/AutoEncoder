@@ -60,7 +60,14 @@ class ModelEvaluator:
             Dictionary with evaluation metrics
         """
         logger.info(f"Evaluating model from {model_path}")
-        
+
+        # Guard against a missing or empty model directory (e.g. disk-full during training)
+        model_dir = Path(model_path)
+        if not model_dir.exists():
+            raise ValueError(f"Model path does not exist: {model_path}")
+        if not any(model_dir.iterdir()):
+            raise ValueError(f"Model path is empty (training may have failed to save): {model_path}")
+
         # Load model
         model = AutoModelForSequenceClassification.from_pretrained(model_path).to(self.device)
         model.eval()
@@ -97,11 +104,21 @@ class ModelEvaluator:
         
         # Calculate metrics
         accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='weighted')
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
         precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
         recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-        
-        avg_inference_time = np.mean(inference_times)
+
+        # Weighted mean: weight each batch by its actual sample count to avoid
+        # the final (smaller) batch skewing the per-sample latency estimate
+        total_samples = len(all_preds)
+        # Recompute from loader length (batch records were appended per-batch)
+        batch_cursor = 0
+        weighted_latency_sum = 0.0
+        for i, t in enumerate(inference_times):
+            bs = batch_size if (batch_cursor + batch_size) <= total_samples else (total_samples - batch_cursor)
+            weighted_latency_sum += t * bs
+            batch_cursor += bs
+        avg_inference_time = weighted_latency_sum / total_samples if total_samples > 0 else 0.0
         
         results = {
             'split': split,
@@ -117,7 +134,13 @@ class ModelEvaluator:
         
         logger.info(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
         logger.info(f"Avg inference time: {avg_inference_time*1000:.2f}ms per sample")
-        
+
+        # Free model memory immediately — each call loads a fresh model instance and
+        # keeping them alive causes GPU OOM when evaluating multiple models in sequence.
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return results
     
     def compare_models(self, results_list: List[Dict]) -> Dict:

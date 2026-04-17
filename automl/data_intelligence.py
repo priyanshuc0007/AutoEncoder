@@ -69,17 +69,48 @@ class DataIntelligence:
             Dictionary with task information
         """
         num_classes = df[label_column].nunique()
+
+        # Guard: if label column is numeric and cardinality is very high relative to the
+        # dataset size, it is almost certainly a regression target, not a class label.
+        # Heuristic: numeric dtype + more than 20% unique values + more than 20 unique values.
+        label_is_numeric = pd.api.types.is_numeric_dtype(df[label_column])
+        cardinality_ratio = num_classes / len(df)
+        if label_is_numeric and num_classes > 20 and cardinality_ratio > 0.2:
+            raise ValueError(
+                f"Label column '{label_column}' looks like a continuous/regression target: "
+                f"{num_classes} unique numeric values out of {len(df)} rows "
+                f"({cardinality_ratio*100:.1f}% cardinality). "
+                f"This pipeline only supports classification. "
+                f"If these are genuinely discrete classes, cast the column to string before running."
+            )
+
+        # Warn when there are suspiciously many classes relative to samples
+        if num_classes > 50:
+            logger.warning(
+                f"⚠️  Label column has {num_classes} unique classes on {len(df)} rows. "
+                f"This is very high cardinality — verify that '{label_column}' is the correct label column."
+            )
+
+        # Detect whether label column contains categorical strings (e.g. spam/ham)
+        # or numeric class IDs (e.g. 0/1/2).  By the time this runs, load_and_validate
+        # has already normalised float/int columns to strings, so a purely numeric-string
+        # column (all values parse as int) signals the original was numeric.
+        all_numeric_strings = pd.to_numeric(df[label_column], errors='coerce').notna().all()
+        label_type = "numeric" if all_numeric_strings else "categorical"
+        logger.info(f"Label type: {label_type} ({'e.g. 0/1/2' if label_type == 'numeric' else 'e.g. spam/ham'})")
+
         task_type = "binary" if num_classes == 2 else "multiclass"
-        
+
         class_dist = df[label_column].value_counts()
-        
+
         info = {
             'task_type': task_type,
+            'label_type': label_type,
             'num_classes': num_classes,
             'class_distribution': class_dist.to_dict(),
             'class_weights': self._compute_class_weights(df[label_column]),
         }
-        
+
         logger.info(f"Task detected: {task_type} ({num_classes} classes)")
         logger.info(f"Class distribution: {class_dist.to_dict()}")
         
@@ -132,7 +163,7 @@ class DataIntelligence:
         # p95 is in characters; convert to approximate token count (≈4 chars/token)
         # and cap at 512 (transformer hard limit).
         p95_chars = int(np.percentile(text_lengths, 95))
-        max_length = min(int(p95_chars / 4), 512)
+        max_length = max(min(int(p95_chars / 4), 512), 16)  # floor at 16 to prevent zero-length tokenization
         avg_length = text_lengths.mean()
         
         info = {
@@ -149,29 +180,47 @@ class DataIntelligence:
     
     def _select_models(self, dataset_size: int, imbalance_info: Dict) -> List[str]:
         """
-        Select appropriate models based on dataset size
-        Uses open-source models available on HuggingFace
-        
+        Select appropriate models based on dataset size.
+        Uses open-source models available on HuggingFace.
+
+        Model roster
+        ------------
+        prajjwal1/bert-tiny  — 4.4M params, 2 hidden layers, fastest inference.
+                               Ideal for small datasets or latency-critical runs.
+        distilbert-base-uncased — 66M params, 6 layers, 40% smaller than BERT-base.
+                               Good balance of speed and accuracy.
+        bert-base-uncased    — 110M params, 12 layers, strongest baseline.
+                               Best for medium/large datasets.
+
         Args:
             dataset_size: Number of samples
             imbalance_info: Imbalance information
-            
+
         Returns:
             List of model names to train
         """
         if dataset_size < 2000:
-            # Lightweight open-source model
-            models = ["distilbert-base-uncased"]
-            logger.info(f"Small dataset ({dataset_size} samples) → DistilBERT (open source)")
+            # Small dataset: bert-tiny (fast, low overfit risk) + DistilBERT for comparison
+            models = ["prajjwal1/bert-tiny", "distilbert-base-uncased"]
+            logger.info(
+                f"Small dataset ({dataset_size} samples) → "
+                f"bert-tiny + DistilBERT (open source)"
+            )
         elif dataset_size < 10000:
-            # Medium open-source model
-            models = ["bert-base-uncased"]
-            logger.info(f"Medium dataset ({dataset_size} samples) → BERT (open source)")
+            # Medium dataset: all three — tiny for speed baseline, distil + bert for quality
+            models = ["prajjwal1/bert-tiny", "distilbert-base-uncased", "bert-base-uncased"]
+            logger.info(
+                f"Medium dataset ({dataset_size} samples) → "
+                f"bert-tiny + DistilBERT + BERT (open source)"
+            )
         else:
-            # Larger open-source models
-            models = ["bert-base-uncased", "distilbert-base-uncased"]
-            logger.info(f"Large dataset ({dataset_size} samples) → BERT + DistilBERT (open source)")
-        
+            # Large dataset: distilbert + bert (tiny less competitive at scale)
+            models = ["distilbert-base-uncased", "bert-base-uncased"]
+            logger.info(
+                f"Large dataset ({dataset_size} samples) → "
+                f"DistilBERT + BERT (open source)"
+            )
+
         return models
     
     def _get_training_config(self, dataset_size: int, imbalance_info: Dict, task_info: Dict) -> Dict:
