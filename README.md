@@ -1,6 +1,6 @@
-# 🚀 AutoML Text Classification - MVP
+# 🚀 AutoLLM — Automated Fine-Tuning Pipeline
 
-A production-grade AutoML system that automatically handles the complete machine learning pipeline for text classification tasks.
+A production-grade AutoLLM system that automatically handles the complete machine learning pipeline for text classification tasks.
 
 ## ✨ Features
 
@@ -114,10 +114,10 @@ text,label
 ### 3. Run the Pipeline
 
 ```python
-from automl import AutoMLPipeline
+from automl import AutoLLMPipeline
 
 # Initialize
-pipeline = AutoMLPipeline(output_dir="experiments")
+pipeline = AutoLLMPipeline(output_dir="experiments")
 
 # Run
 result = pipeline.run(

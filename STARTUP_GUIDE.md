@@ -1,6 +1,6 @@
 # 🚀 Getting Started - Complete Startup Guide
 
-Choose your preferred way to test the AutoML system!
+Choose your preferred way to test the AutoLLM system!
 
 ---
 
@@ -206,9 +206,9 @@ curl -X POST http://localhost:5000/api/pipeline/run \
 
 ### Python Client (Easier)
 ```python
-from api_client import AutoMLClient
+from api_client import AutoLLMClient
 
-client = AutoMLClient('http://localhost:5000')
+client = AutoLLMClient('http://localhost:5000')
 
 # Run pipeline
 exp_id = client.run_pipeline(
@@ -253,15 +253,15 @@ python quickstart.py
 ### Expected Output
 ```
 ======================================================================
-🚀 AutoML Pipeline - Quick Start Test
+🚀 AutoLLM Pipeline - Quick Start Test
 ======================================================================
 
 ✓ Found sample data at data/sample_dataset.csv
 
-📌 Step 1: Initializing AutoML Pipeline...
+📌 Step 1: Initializing AutoLLM Pipeline...
 ✓ Pipeline initialized
 
-📌 Step 2: Running AutoML Pipeline...
+📌 Step 2: Running AutoLLM Pipeline...
 ⏳ This may take a few minutes...
 
 ======================================================================
@@ -295,7 +295,7 @@ text,label
 
 #### Flask API
 ```python
-client = AutoMLClient()
+client = AutoLLMClient()
 exp_id = client.run_pipeline(
     csv_path='your_file.csv',
     label_column='label',
@@ -305,9 +305,9 @@ exp_id = client.run_pipeline(
 
 #### Command Line
 ```python
-from automl import AutoMLPipeline
+from automl import AutoLLMPipeline
 
-pipeline = AutoMLPipeline()
+pipeline = AutoLLMPipeline()
 result = pipeline.run(
     csv_path='your_file.csv',
     label_column='label',

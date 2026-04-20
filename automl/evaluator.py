@@ -17,6 +17,7 @@ from sklearn.metrics import (
     accuracy_score,
 )
 import logging
+import statistics
 import time
 from typing import Dict, List, Tuple
 from pathlib import Path
@@ -87,9 +88,14 @@ class ModelEvaluator:
                 attention_mask = batch['attention_mask'].to(self.device)
                 batch_labels = batch['labels'].to(self.device)
                 
-                # Time inference
+                # Time inference — synchronize GPU before/after so we measure
+                # actual compute time, not just async kernel dispatch time.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 start_time = time.time()
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 inference_time = (time.time() - start_time) / len(input_ids)  # per sample
                 inference_times.append(inference_time)
                 
@@ -99,6 +105,50 @@ class ModelEvaluator:
                 all_preds.extend(preds)
                 all_labels.extend(batch_labels.cpu().numpy())
         
+        # --- Single-sample latency: one request at a time, tokenization included ---
+        # This is the metric that matters for deployment — not batch throughput ÷ N.
+        # We run 1 warmup (discarded) + up to 10 timed calls, each on a single text.
+        _n_timing = min(10, len(texts))
+        _single_times: List[float] = []
+        with torch.no_grad():
+            # Warmup — discarded to exclude cold CUDA kernel compilation overhead
+            _wenc = tokenizer(
+                str(texts[0]),
+                max_length=max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt',
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _ = model(
+                input_ids=_wenc['input_ids'].to(self.device),
+                attention_mask=_wenc['attention_mask'].to(self.device),
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            # Timed single-sample runs
+            for _txt in texts[:_n_timing]:
+                _enc = tokenizer(
+                    str(_txt),
+                    max_length=max_length,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt',
+                )
+                _ids  = _enc['input_ids'].to(self.device)
+                _mask = _enc['attention_mask'].to(self.device)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _t0 = time.time()
+                _ = model(input_ids=_ids, attention_mask=_mask)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _single_times.append(time.time() - _t0)
+        single_sample_latency_ms = (
+            statistics.mean(_single_times) * 1000 if _single_times else 0.0
+        )
+
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         
@@ -126,14 +176,18 @@ class ModelEvaluator:
             'f1_score': f1,
             'precision': precision,
             'recall': recall,
-            'avg_inference_time_ms': avg_inference_time * 1000,  # Convert to ms
+            'avg_inference_time_ms': avg_inference_time * 1000,  # batch throughput (ms/sample)
+            'single_sample_latency_ms': single_sample_latency_ms,  # real single-request latency
             'predictions': all_preds,
             'true_labels': all_labels,
             'confusion_matrix': confusion_matrix(all_labels, all_preds),
         }
         
         logger.info(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
-        logger.info(f"Avg inference time: {avg_inference_time*1000:.2f}ms per sample")
+        logger.info(
+            f"Batch throughput: {avg_inference_time*1000:.2f}ms/sample  |  "
+            f"Single-sample: {single_sample_latency_ms:.2f}ms"
+        )
 
         # Free model memory immediately — each call loads a fresh model instance and
         # keeping them alive causes GPU OOM when evaluating multiple models in sequence.
@@ -167,25 +221,40 @@ class ModelEvaluator:
             }
         
         # Calculate composite score
+        # Latency reference is set to the MEDIAN latency across all models so
+        # the bonus/penalty is relative — no single model architecture receives
+        # a structural advantage just by being small/fast.
+        # Use single_sample_latency_ms for composite score — it reflects real deployment
+        # latency (one request + tokenization, CUDA sync'd). Fall back to batch throughput
+        # if single-sample latency is absent (e.g. results built by older code).
+        latency_key = (
+            'single_sample_latency_ms'
+            if all('single_sample_latency_ms' in r for r in results_list)
+            else 'avg_inference_time_ms'
+        )
+        latencies = [r[latency_key] for r in results_list]
+        # statistics.median() is correct for all N — sorted()[N//2] returns max for N=2
+        median_latency = statistics.median(latencies) if latencies else 100.0
+        median_latency = max(median_latency, 1.0)  # guard against zero
         for result in results_list:
-            # Weighted score: 70% F1, 30% (inverse of latency)
-            # Higher latency → lower score
             f1_component = result['f1_score'] * 0.7
-            latency_component = (1.0 / (1.0 + result['avg_inference_time_ms'] / 100)) * 0.3
+            latency_component = (1.0 / (1.0 + result[latency_key] / median_latency)) * 0.3
             result['composite_score'] = f1_component + latency_component
         
         # Sort by composite score
         sorted_results = sorted(results_list, key=lambda x: x['composite_score'], reverse=True)
         
         # Print comparison table
-        print(f"{'Model':<30} {'F1':<8} {'Accuracy':<10} {'Latency(ms)':<12} {'Score':<8}")
-        print("-" * 70)
-        
+        print(f"{'Model':<30} {'F1':<8} {'Accuracy':<10} {'Batch(ms)':<12} {'Single(ms)':<12} {'Score':<8}")
+        print("-" * 88)
+
         for i, result in enumerate(sorted_results):
             marker = "🏆 BEST" if i == 0 else ""
             model_name = result.get('model_name', 'Unknown')[:28]
+            single_lat = result.get('single_sample_latency_ms', result['avg_inference_time_ms'])
             print(f"{model_name:<30} {result['f1_score']:<8.4f} {result['accuracy']:<10.4f} "
-                  f"{result['avg_inference_time_ms']:<12.2f} {result['composite_score']:<8.4f} {marker}")
+                  f"{result['avg_inference_time_ms']:<12.2f} {single_lat:<12.2f} "
+                  f"{result['composite_score']:<8.4f} {marker}")
         
         best_model = sorted_results[0]
         
@@ -211,7 +280,8 @@ class ModelEvaluator:
                 'Accuracy': result['accuracy'],
                 'Precision': result['precision'],
                 'Recall': result['recall'],
-                'Latency (ms)': result['avg_inference_time_ms'],
+                'Batch Latency (ms)': result['avg_inference_time_ms'],
+                'Single-Sample Latency (ms)': result.get('single_sample_latency_ms', result['avg_inference_time_ms']),
                 'Composite Score': result['composite_score'],
             })
         

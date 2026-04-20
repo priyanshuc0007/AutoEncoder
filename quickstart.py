@@ -1,16 +1,16 @@
 """
-Quick Start - Test AutoML Pipeline Immediately
+Quick Start - Test AutoLLM Pipeline Immediately
 Run this script to test the pipeline with sample data
 """
 
-from automl import AutoMLPipeline
+from automl import AutoLLMPipeline
 import sys
 import os
 
 
 def main():
     print("\n" + "="*70)
-    print("🚀 AutoML Pipeline - Quick Start Test")
+    print("🚀 AutoLLM Pipeline - Quick Start Test")
     print("="*70 + "\n")
     
     # Check if sample data exists
@@ -24,12 +24,12 @@ def main():
     
     try:
         # Initialize pipeline
-        print("📌 Step 1: Initializing AutoML Pipeline...")
-        pipeline = AutoMLPipeline(output_dir="experiments")
+        print("📌 Step 1: Initializing AutoLLM Pipeline...")
+        pipeline = AutoLLMPipeline(output_dir="experiments")
         print("✓ Pipeline initialized\n")
         
         # Run pipeline
-        print("📌 Step 2: Running AutoML Pipeline...")
+        print("📌 Step 2: Running AutoLLM Pipeline...")
         print("This will:")
         print("  • Analyze your data")
         print("  • Select optimal models")
@@ -59,7 +59,7 @@ def main():
             print(f"📋 Report: {result['experiment_dir']}/best_model_report.txt\n")
             
             print("="*70)
-            print("✅ SUCCESS! Your AutoML system is working!")
+            print("✅ SUCCESS! Your AutoLLM system is working!")
             print("="*70 + "\n")
             
             print("📚 Next Steps:")

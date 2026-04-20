@@ -47,8 +47,11 @@ class WeightedTrainer(Trainer):
         self.focal_gamma = focal_gamma
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
+        # Use .get() + filtered copy instead of .pop() to avoid mutating the
+        # shared batch dict — Trainer callbacks may inspect it after this call.
+        labels = inputs.get("labels")
+        inputs_no_labels = {k: v for k, v in inputs.items() if k != "labels"}
+        outputs = model(**inputs_no_labels)
         logits = outputs.logits
 
         if self.use_focal_loss:
@@ -109,17 +112,18 @@ class ModelTrainer:
         Returns:
             Tuple of (data_dict, label_encoder)
         """
-        # Encode labels
-        le = LabelEncoder()
-        labels = le.fit_transform(df[label_column])
-        
-        logger.info(f"Label mapping: {dict(zip(le.classes_, le.transform(le.classes_)))}")
-        
-        # Split data
+        # Split data first — fit LabelEncoder only on train labels to prevent leakage
         texts = df[text_column].tolist()
-        train_texts, val_texts, train_labels, val_labels = train_test_split(
-            texts, labels, test_size=test_size, random_state=42, stratify=labels
+        raw_labels = df[label_column].tolist()
+        train_texts, val_texts, train_labels_raw, val_labels_raw = train_test_split(
+            texts, raw_labels, test_size=test_size, random_state=42, stratify=raw_labels
         )
+
+        le = LabelEncoder()
+        train_labels = le.fit_transform(train_labels_raw)
+        val_labels   = le.transform(val_labels_raw)
+
+        logger.info(f"Label mapping: {dict(zip(le.classes_, le.transform(le.classes_)))}")
         
         data = {
             'train_texts': train_texts,
@@ -324,6 +328,8 @@ class ModelTrainer:
         class_weights: Dict = None,
         use_focal_loss: bool = False,
         experiment_name: str = "default",
+        use_optuna: bool = False,
+        optuna_trials: int = 10,
     ) -> List[Dict]:
         """
         Train multiple models with hyperparameter tuning
@@ -336,24 +342,59 @@ class ModelTrainer:
             use_class_weights: Use class weights
             class_weights: Class weights
             experiment_name: Experiment name
+            use_optuna: Run Optuna search for lr + weight_decay before training
+            optuna_trials: Number of Optuna trials per model (clamped 3–20)
             
         Returns:
             List of training results
         """
         all_results = []
-        
+
+        # Run Optuna per model and store each model's config separately.
+        # Previously, a single merged_config was overwritten each iteration so all
+        # models ended up with the last model's hyperparameters — now fixed.
+        optuna_configs = {}
         for model_name in model_names:
+            cfg = dict(hyperparams_ranges)  # shallow copy — never mutate original
+            if use_optuna:
+                try:
+                    from automl.tuner import HyperparameterTuner
+                    tuner = HyperparameterTuner()
+                    best_params = tuner.tune(
+                        model_name=model_name,
+                        data=data,
+                        config=hyperparams_ranges,
+                        max_length=max_length,
+                        use_class_weights=use_class_weights,
+                        class_weights=class_weights,
+                        use_focal_loss=use_focal_loss,
+                        n_trials=optuna_trials,
+                    )
+                    # Merge only the params Optuna returned; keep all else rule-based
+                    if best_params:
+                        cfg.update(best_params)
+                        logger.info(
+                            f"✅ Using Optuna params for {model_name}: "
+                            f"LR={cfg['learning_rate']:.2e}  "
+                            f"WD={cfg['weight_decay']:.4f}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Optuna failed for {model_name} ({e}). Using rule-based config.")
+            optuna_configs[model_name] = cfg
+
+        for model_name in model_names:
+            merged_config = optuna_configs[model_name]
             # Try different hyperparameter combinations
-            for num_epochs in hyperparams_ranges['num_epochs_range']:
+            for num_epochs in merged_config['num_epochs_range']:
                 for lr_scale in [1.0]:  # single learning rate per epoch configuration
                     
-                    learning_rate = hyperparams_ranges['learning_rate'] * lr_scale
-                    batch_size = hyperparams_ranges['batch_size']
-                    gradient_accumulation_steps = hyperparams_ranges.get('gradient_accumulation_steps', 1)
-                    warmup_steps = hyperparams_ranges.get('warmup_steps', 500)
-                    weight_decay = hyperparams_ranges.get('weight_decay', 0.01)
-                    max_grad_norm = hyperparams_ranges.get('max_grad_norm', 1.0)
-                    early_stopping_patience = hyperparams_ranges.get('early_stopping_patience', 3)
+                    learning_rate = merged_config['learning_rate'] * lr_scale
+                    batch_size = merged_config['batch_size']
+                    gradient_accumulation_steps = merged_config.get('gradient_accumulation_steps', 1)
+                    warmup_steps = merged_config.get('warmup_steps', 500)
+                    weight_decay = merged_config.get('weight_decay', 0.01)
+                    max_grad_norm = merged_config.get('max_grad_norm', 1.0)
+                    early_stopping_patience = merged_config.get('early_stopping_patience', 3)
                     
                     try:
                         result = self.train_model(
@@ -374,10 +415,16 @@ class ModelTrainer:
                             early_stopping_patience=early_stopping_patience,
                         )
                         all_results.append(result)
-                        
+
                     except Exception as e:
                         logger.error(f"Error training {model_name} with epochs={num_epochs}: {str(e)}")
                         continue
+                    finally:
+                        # Free GPU memory after each model to prevent OOM on the next model
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 
                 # Only train the first (minimum) epoch value per model.
                 # The upper bound of num_epochs_range is reserved for future

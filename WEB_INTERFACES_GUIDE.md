@@ -1,6 +1,6 @@
 # 🌐 Web Interfaces Guide
 
-This guide shows you how to use both **Streamlit** and **Flask** interfaces to test the AutoML system.
+This guide shows you how to use both **Streamlit** and **Flask** interfaces to test the AutoLLM system.
 
 ## 📋 Overview
 
@@ -138,7 +138,7 @@ GET /api/info
 
 Response:
 {
-    "name": "AutoML Text Classification API",
+    "name": "AutoLLM Text Classification API",
     "version": "1.0.0",
     "endpoints": { ... }
 }

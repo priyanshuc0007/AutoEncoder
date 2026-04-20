@@ -1,5 +1,5 @@
 """
-Main AutoML Pipeline Orchestrator
+AutoLLM Pipeline Orchestrator
 Coordinates all components: validation, intelligence, training, evaluation
 """
 
@@ -8,11 +8,13 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
+import pandas as pd
 
 from automl.data_validator import DataValidator
 from automl.data_intelligence import DataIntelligence
 from automl.model_trainer import ModelTrainer
 from automl.evaluator import ModelEvaluator
+from automl.cross_validator import CrossValidator
 
 # Trust layer — non-invasive reliability and transparency modules
 from automl.trust.reproducibility import set_global_seeds
@@ -26,8 +28,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class AutoMLPipeline:
-    """Main AutoML pipeline orchestrator"""
+class AutoLLMPipeline:
+    """Main AutoLLM pipeline orchestrator"""
     
     def __init__(self, output_dir: str = "experiments"):
         self.output_dir = Path(output_dir)
@@ -43,6 +45,9 @@ class AutoMLPipeline:
         self.data = None
         self.training_results = None
         self.comparison = None
+        self._df = None            # full validated DataFrame (needed for CV)
+        self._label_column = None  # resolved label column name
+        self._text_column = None   # resolved text column name
 
         # Trust layer objects (never affect training or return values)
         self._seed = 42
@@ -56,9 +61,13 @@ class AutoMLPipeline:
         text_column: Optional[str] = None,
         text_columns: Optional[list] = None,
         experiment_name: Optional[str] = None,
+        use_cv: bool = False,
+        cv_folds: int = 5,
+        use_optuna: bool = False,
+        optuna_trials: int = 10,
     ) -> Dict:
         """
-        Run complete AutoML pipeline
+        Run complete AutoLLM pipeline
         
         Args:
             csv_path: Path to CSV file
@@ -66,6 +75,10 @@ class AutoMLPipeline:
             text_column: Single text column name (auto-detected if None)
             text_columns: List of text columns to merge (overrides text_column if provided)
             experiment_name: Name for this experiment
+            use_cv: Whether to run cross-validation on the best model
+            cv_folds: Number of CV folds (used only when use_cv=True)
+            use_optuna: Whether to run Optuna hyperparameter search (lr + weight_decay)
+            optuna_trials: Number of Optuna trials per model (clamped 3–20)
             
         Returns:
             Dictionary with pipeline results
@@ -80,11 +93,11 @@ class AutoMLPipeline:
         try:
             set_global_seeds(self._seed)
             self.tracker.start(experiment_name, self.experiment_dir, self._seed)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.debug("[Trust] seed/tracker init failed (non-fatal): %s", _e)
 
         logger.info(f"\n{'='*70}")
-        logger.info("🚀 AUTOML PIPELINE STARTED")
+        logger.info("🚀 AUTOLLM PIPELINE STARTED")
         logger.info(f"Experiment: {experiment_name}")
         logger.info(f"{'='*70}\n")
         
@@ -99,14 +112,18 @@ class AutoMLPipeline:
             )
             
             # Detect all text columns — used for informational logging and
-            # to provide the primary column when text_columns is not supplied.
-            # The result is also used below when text_columns overrides are applied.
+            # to provide the primary column when text_columns is not supplied
+            # AND the caller did not explicitly specify text_column.
             detected_columns = self.validator.detect_text_columns(df, label_column)
-            
-            # If no explicit text_columns override, use the auto-detected primary column
-            if not text_columns:
+
+            # Only fall back to auto-detection when the caller gave neither
+            # text_column nor text_columns — an explicit text_column must not
+            # be silently replaced by a longer-text column.
+            if not text_columns and text_column is None:
                 text_column = detected_columns['primary_text_column']
                 logger.info(f"Using auto-detected primary text column: {text_column}")
+            elif not text_columns:
+                logger.info(f"Using caller-supplied text column: {text_column}")
             
             # Validate every entry in text_columns before use
             if text_columns:
@@ -126,6 +143,11 @@ class AutoMLPipeline:
                 logger.info(f"Using single text column: {text_column}")
             
             logger.info(f"Final text column for training: {text_column}")
+
+            # Store for use by optional CV step (needs full df, not just train split)
+            self._df = df
+            self._label_column = label_column
+            self._text_column = text_column
 
             # Trust: data quality audit (saved as data_quality_report.txt)
             try:
@@ -150,8 +172,8 @@ class AutoMLPipeline:
                 self.decisions.save(self.experiment_dir)
                 self.tracker.complete_step("data_intelligence")
                 self.tracker.begin_step("data_preparation")
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("[Trust] decisions/tracker failed (non-fatal): %s", _e)
 
             # Step 3: Prepare data
             logger.info("\n🔄 STEP 3: Data Preparation")
@@ -159,7 +181,17 @@ class AutoMLPipeline:
             self.data, label_encoder = self.trainer.prepare_data(
                 df, label_column, text_column
             )
-            
+
+            # Recompute class weights from training labels only — prevents val label
+            # distribution from leaking into the training loss via class weight statistics.
+            train_class_weights = self.analysis['task_info']['class_weights']  # fallback
+            if self.analysis['imbalance_info']['use_class_weights']:
+                train_label_strings = pd.Series(
+                    label_encoder.inverse_transform(self.data['train_labels'])
+                )
+                train_class_weights = self.intelligence._compute_class_weights(train_label_strings)
+                logger.info("ℹ️  Class weights recomputed from training set only (no val leakage)")
+
             # Step 4: Train models
             try:
                 self.tracker.complete_step("data_preparation")
@@ -173,9 +205,11 @@ class AutoMLPipeline:
                 hyperparams_ranges=self.analysis['training_config'],
                 max_length=self.analysis['text_info']['p95_length'],
                 use_class_weights=self.analysis['imbalance_info']['use_class_weights'],
-                class_weights=self.analysis['task_info']['class_weights'],
+                class_weights=train_class_weights,
                 use_focal_loss=self.analysis['imbalance_info']['use_focal_loss'],
                 experiment_name=experiment_name,
+                use_optuna=use_optuna,
+                optuna_trials=optuna_trials,
             )
             
             logger.info(f"\n✓ Trained {len(self.training_results)} model(s)")
@@ -185,8 +219,8 @@ class AutoMLPipeline:
                 logger.error("❌ No models were successfully trained!")
                 try:
                     self.tracker.mark_failed("No models were successfully trained")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.debug("[Trust] tracker mark_failed skipped: %s", _e)
                 return {
                     'status': 'failed',
                     'error': 'No models were successfully trained. Check your data and configuration.',
@@ -231,8 +265,8 @@ class AutoMLPipeline:
                 logger.error("❌ No best model could be selected!")
                 try:
                     self.tracker.mark_failed("No best model could be selected from evaluation results")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.debug("[Trust] tracker mark_failed skipped: %s", _e)
                 return {
                     'status': 'failed',
                     'error': 'No best model could be selected from evaluation results.',
@@ -251,8 +285,8 @@ class AutoMLPipeline:
                 self.tracker.begin_step("best_model_selection")
                 self.tracker.complete_step("best_model_selection")
                 self.tracker.begin_step("report_generation")
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("[Trust] baseline/tracker failed (non-fatal): %s", _e)
 
             # Step 7: Generate report
             logger.info("\n📋 STEP 7: Report Generation")
@@ -324,15 +358,45 @@ class AutoMLPipeline:
             except Exception as e:
                 logger.warning(f"Explainability step skipped: {e}")
 
+            # Optional: cross-validation on best model architecture
+            cv_results = None
+            if use_cv:
+                logger.info(f"\n🔁 CROSS-VALIDATION ({cv_folds}-fold) — {best_model_result.get('model_name')}")
+                logger.info("-" * 70)
+                logger.info("NOTE: Each fold retrains the model from scratch. This will take "
+                            f"~{cv_folds}× the time of a single training run.")
+                try:
+                    best_model_name_for_cv = best_model_result.get('model_name') or \
+                        best_tr.get('model_name', 'distilbert-base-uncased')
+                    cv = CrossValidator(output_dir="models")
+                    cv_results = cv.run(
+                        model_name=best_model_name_for_cv,
+                        df=self._df,
+                        label_column=self._label_column,
+                        text_column=self._text_column,
+                        hyperparams=self.analysis['training_config'],
+                        max_length=self.analysis['text_info']['p95_length'],
+                        label_encoder=label_encoder,
+                        use_class_weights=self.analysis['imbalance_info']['use_class_weights'],
+                        class_weights=train_class_weights,
+                        use_focal_loss=self.analysis['imbalance_info']['use_focal_loss'],
+                        n_splits=cv_folds,
+                        experiment_name=experiment_name,
+                    )
+                    # Save CV summary to experiment dir
+                    self._save_cv_report(cv_results)
+                except Exception as e:
+                    logger.warning(f"Cross-validation skipped: {e}")
+
             # Trust: finalise tracking
             try:
                 self.tracker.complete_step("report_generation")
                 self.tracker.finish()
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("[Trust] tracker finish failed (non-fatal): %s", _e)
 
             logger.info(f"\n{'='*70}")
-            logger.info("✓ AUTOML PIPELINE COMPLETED SUCCESSFULLY")
+            logger.info("✓ AUTOLLM PIPELINE COMPLETED SUCCESSFULLY")
             logger.info(f"Best Model: {best_model_result.get('model_name', 'Unknown')}")
             logger.info(f"F1 Score: {best_model_result['f1_score']:.4f}")
             logger.info(f"Experiment saved to: {self.experiment_dir}")
@@ -352,14 +416,15 @@ class AutoMLPipeline:
                 'data_analysis': self.analysis,
                 'comparison_df': self.comparison['comparison_df'],
                 'explainability': explainability_data,
+                'cv_results': cv_results,
             }
             
         except Exception as e:
             # Trust: record failure in pipeline state
             try:
                 self.tracker.mark_failed(str(e))
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("[Trust] tracker mark_failed skipped: %s", _e)
             logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
             return {
                 'status': 'failed',
@@ -381,3 +446,65 @@ class AutoMLPipeline:
             pickle.dump(config, f)
         
         logger.info(f"Configuration saved to {config_path}")
+
+    def _save_cv_report(self, cv_results: Dict) -> None:
+        """Write a human-readable cross_validation_report.txt to the experiment folder."""
+        path = self.experiment_dir / "cross_validation_report.txt"
+        sep = "=" * 70
+        lines = [
+            sep,
+            f"CROSS-VALIDATION REPORT  ({cv_results['n_splits']}-fold Stratified)",
+            sep,
+            f"Model         : {cv_results['model_name']}",
+            f"Folds         : {cv_results['n_splits']}  "
+            f"({cv_results['n_successful_folds']} successful)",
+            "",
+        ]
+
+        # Show error reason if CV failed before any folds ran
+        if cv_results.get("error") and cv_results["n_successful_folds"] == 0:
+            lines += [
+                "CV FAILED",
+                "-" * 50,
+                f"  Reason: {cv_results['error']}",
+                "",
+            ]
+
+        summary = cv_results.get("summary", {})
+        if summary:
+            lines += [
+                "SUMMARY  (mean ± std  across successful folds)",
+                "-" * 50,
+                f"  F1 Score  : {summary['f1']['mean']:.4f} ± {summary['f1']['std']:.4f}"
+                f"  (min {summary['f1']['min']:.4f} / max {summary['f1']['max']:.4f})",
+                f"  Accuracy  : {summary['accuracy']['mean']:.4f} ± {summary['accuracy']['std']:.4f}",
+                f"  Precision : {summary['precision']['mean']:.4f} ± {summary['precision']['std']:.4f}",
+                f"  Recall    : {summary['recall']['mean']:.4f} ± {summary['recall']['std']:.4f}",
+                "",
+            ]
+
+        lines += [
+            "PER-FOLD RESULTS",
+            "-" * 50,
+            f"  {'Fold':<6} {'Train':>6} {'Val':>6} {'F1':>8} {'Accuracy':>10} {'Status'}",
+            "  " + "-" * 46,
+        ]
+        for r in cv_results.get("fold_results", []):
+            if r["f1"] is not None:
+                lines.append(
+                    f"  {r['fold']:<6} {r['n_train']:>6} {r['n_val']:>6} "
+                    f"{r['f1']:>8.4f} {r['accuracy']:>10.4f}  ✅"
+                )
+            else:
+                lines.append(
+                    f"  {r['fold']:<6} {r['n_train']:>6} {r['n_val']:>6} "
+                    f"{'N/A':>8} {'N/A':>10}  ❌ {r.get('error', '')[:40]}"
+                )
+
+        lines.append(sep)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            logger.info(f"Cross-validation report saved to {path}")
+        except Exception as e:
+            logger.warning(f"Could not save CV report: {e}")

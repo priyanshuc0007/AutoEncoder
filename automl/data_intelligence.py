@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class DataIntelligence:
-    """Analyzes dataset and provides intelligence for AutoML decisions"""
+    """Analyzes dataset and provides intelligence for AutoLLM decisions"""
     
     def __init__(self):
         pass
@@ -274,6 +274,8 @@ class DataIntelligence:
             early_stopping_patience = 7
             weight_decay = 0.02  # Stronger regularization
             max_grad_norm = 0.5  # Tighter gradient clipping
+            lr_bounds = (2e-4, 5e-4)       # Optuna skips CRITICAL, but bounds set for completeness
+            wd_bounds = (0.01, 0.04)
             
             logger.info(f"\n⚠️  CRITICAL STRATEGY: Only {samples_per_class:.1f} samples/class")
             logger.info(f"    → Extreme overfitting risk")
@@ -291,6 +293,8 @@ class DataIntelligence:
             early_stopping_patience = 6
             weight_decay = 0.015
             max_grad_norm = 0.75
+            lr_bounds = (1e-4, 5e-4)       # Higher LR range — small data needs stronger signal
+            wd_bounds = (0.005, 0.03)
             
             logger.info(f"\n🟡 SMALL DATA STRATEGY: {samples_per_class:.1f} samples/class")
             logger.info(f"    → Enhanced training with regularization")
@@ -307,6 +311,8 @@ class DataIntelligence:
             early_stopping_patience = 4
             weight_decay = 0.01
             max_grad_norm = 1.0
+            lr_bounds = (5e-5, 2e-4)       # Standard fine-tuning range
+            wd_bounds = (0.0, 0.02)
             
             logger.info(f"\n🟢 MODERATE DATA STRATEGY: {samples_per_class:.1f} samples/class")
             logger.info(f"    → Standard training with careful monitoring")
@@ -322,6 +328,8 @@ class DataIntelligence:
             early_stopping_patience = 3
             weight_decay = 0.01
             max_grad_norm = 1.0
+            lr_bounds = (1e-5, 1e-4)       # Conservative range — more data means lower LR works well
+            wd_bounds = (0.0, 0.02)
             
             logger.info(f"\n✅ GOOD DATA STRATEGY: {samples_per_class:.1f} samples/class")
             logger.info(f"    → Standard fine-tuning approach")
@@ -338,9 +346,11 @@ class DataIntelligence:
             'num_epochs_range': num_epochs_range,
             'batch_size': batch_size,
             'learning_rate': learning_rate,
+            'lr_bounds': lr_bounds,
+            'weight_decay': weight_decay,
+            'weight_decay_bounds': wd_bounds,
             'gradient_accumulation_steps': gradient_accumulation_steps,
             'warmup_steps': warmup_steps,
-            'weight_decay': weight_decay,
             'max_grad_norm': max_grad_norm,
             'early_stopping_patience': early_stopping_patience,
             'use_class_weights': imbalance_info['use_class_weights'],

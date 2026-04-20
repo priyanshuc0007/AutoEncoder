@@ -140,6 +140,8 @@ def compute_token_importance(
                 # Runs a second forward pass with gradient tracking on the
                 # input embeddings; L2-norm of the gradient gives per-token
                 # importance without relying on attention outputs.
+                if not hasattr(model, 'get_input_embeddings'):
+                    continue  # model doesn't support embedding access — skip sample
                 model.zero_grad()
                 input_embeds = (
                     model.get_input_embeddings()(inputs["input_ids"])

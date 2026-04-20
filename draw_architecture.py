@@ -87,9 +87,9 @@ ax.set_ylim(0, 1)
 ax.axis("off")
 
 # ── Title ────────────────────────────────────────────────────────────────────
-txt(ax, 0.5, 0.971, "AutoML Pipeline Architecture", size=16,
+txt(ax, 0.5, 0.971, "AutoLLM Pipeline Architecture", size=16,
     color=C["white"], bold=True)
-txt(ax, 0.5, 0.955, "automl/  ·  End-to-end text classification with Trust Layer",
+txt(ax, 0.5, 0.955, "autollm/  ·  End-to-end text classification with Trust Layer",
     size=9, color=C["dim"])
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -266,8 +266,8 @@ txt(ax, leg_x + 0.005, leg_y + 0.060, "LEGEND", size=8, bold=True,
     color=C["white"], ha="left")
 
 legend_items = [
-    (C["pipe"],  C["pipe_edge"],  "Main pipeline step  (automl/*.py)"),
-    (C["trust"], C["trust_edge"], "Trust Layer pillar  (automl/trust/*.py)"),
+    (C["pipe"],  C["pipe_edge"],  "Main pipeline step  (autollm/*.py)"),
+    (C["trust"], C["trust_edge"], "Trust Layer pillar  (autollm/trust/*.py)"),
     (C["io"],    C["io_edge"],    "Input / Output"),
 ]
 for i, (fc, ec, label) in enumerate(legend_items):

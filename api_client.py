@@ -1,5 +1,5 @@
 """
-Python Client for AutoML Flask API
+Python Client for AutoLLM Flask API
 Example of how to use the API programmatically
 """
 
@@ -10,8 +10,8 @@ import json
 from pathlib import Path
 
 
-class AutoMLClient:
-    """Client for interacting with AutoML Flask API"""
+class AutoLLMClient:
+    """Client for interacting with AutoLLM Flask API"""
     
     def __init__(self, base_url='http://localhost:5000'):
         self.base_url = base_url
@@ -28,13 +28,13 @@ class AutoMLClient:
     
     def get_info(self):
         """Get API information"""
-        response = self.session.get(f'{self.base_url}/api/info')
+        response = self.session.get(f'{self.base_url}/api/v1/pipeline/info')
         return response.json()
     
     def run_pipeline(self, csv_path, label_column, text_column=None, 
                      experiment_name=None):
         """
-        Run AutoML pipeline
+        Run AutoLLM pipeline
         
         Args:
             csv_path: Path to CSV file
@@ -54,30 +54,31 @@ class AutoMLClient:
             }
             
             response = self.session.post(
-                f'{self.base_url}/api/pipeline/run',
+                f'{self.base_url}/api/v1/pipeline/run',
                 files=files,
                 data=data
             )
         
         if response.status_code in [200, 202]:
             result = response.json()
-            print(f"✓ Pipeline started: {result['experiment_id']}")
-            return result['experiment_id']
+            job_id = result.get('job_id')
+            print(f"✓ Pipeline started: {job_id}")
+            return job_id
         else:
             print(f"❌ Failed to start pipeline: {response.text}")
             return None
     
-    def get_status(self, experiment_id):
+    def get_status(self, job_id):
         """Get pipeline status"""
         response = self.session.get(
-            f'{self.base_url}/api/pipeline/{experiment_id}/status'
+            f'{self.base_url}/api/v1/jobs/{job_id}'
         )
         return response.json()
     
-    def get_results(self, experiment_id):
+    def get_results(self, job_id):
         """Get pipeline results"""
         response = self.session.get(
-            f'{self.base_url}/api/pipeline/{experiment_id}/results'
+            f'{self.base_url}/api/v1/jobs/{job_id}/results'
         )
         
         if response.status_code == 200:
@@ -85,45 +86,47 @@ class AutoMLClient:
         else:
             return {'error': response.json().get('error')}
     
-    def wait_for_completion(self, experiment_id, max_wait=3600, poll_interval=30):
+    def wait_for_completion(self, job_id, max_wait=3600, poll_interval=30):
         """
         Wait for pipeline to complete
-        
+
         Args:
-            experiment_id: Experiment ID
+            job_id: Job ID returned by run_pipeline()
             max_wait: Maximum wait time in seconds
             poll_interval: Poll interval in seconds
         """
         start_time = time.time()
-        
+
         while True:
-            status = self.get_status(experiment_id)
-            print(f"Status: {status.get('status')}")
-            
-            if status.get('status') == 'success':
+            status = self.get_status(job_id)
+            current = status.get('status')
+            print(f"Status: {current}")
+
+            # Server sets status to 'completed' (not 'success') on success
+            if current == 'completed':
                 print("✓ Pipeline completed successfully!")
-                return self.get_results(experiment_id)
-            elif status.get('status') == 'failed':
-                print(f"❌ Pipeline failed!")
-                return self.get_results(experiment_id)
-            
+                return self.get_results(job_id)
+            elif current == 'failed':
+                print("❌ Pipeline failed!")
+                return status
+
             elapsed = time.time() - start_time
             if elapsed > max_wait:
                 print(f"⏱️ Timeout after {elapsed:.0f}s")
                 return None
-            
+
             print(f"⏳ Waiting... ({elapsed:.0f}s elapsed)")
             time.sleep(poll_interval)
     
     def list_experiments(self):
         """List all experiments"""
-        response = self.session.get(f'{self.base_url}/api/experiments')
+        response = self.session.get(f'{self.base_url}/api/v1/jobs')
         return response.json()
     
-    def get_report(self, experiment_id):
+    def get_report(self, job_id):
         """Get experiment report"""
         response = self.session.get(
-            f'{self.base_url}/api/pipeline/{experiment_id}/report'
+            f'{self.base_url}/api/v1/jobs/{job_id}/report'
         )
         
         if response.status_code == 200:
@@ -172,14 +175,14 @@ class AutoMLClient:
 
 
 def main():
-    """Example usage of AutoML client"""
+    """Example usage of AutoLLM client"""
     
     print("\n" + "="*70)
-    print("🚀 AutoML API Client Example")
+    print("🚀 AutoLLM API Client Example")
     print("="*70 + "\n")
     
     # Initialize client
-    client = AutoMLClient(base_url='http://localhost:5000')
+    client = AutoLLMClient(base_url='http://localhost:5000')
     
     # Check health
     print("1️⃣  Checking API health...")
@@ -204,7 +207,7 @@ def main():
         return
     
     # Run pipeline
-    print("3️⃣  Running AutoML pipeline...")
+    print("3️⃣  Running AutoLLM pipeline...")
     print(f"Using data from: {sample_csv}")
     
     exp_id = client.run_pipeline(

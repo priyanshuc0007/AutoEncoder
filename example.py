@@ -1,6 +1,6 @@
 """
-Example: Run AutoML Pipeline
-Demonstrates how to use the AutoML system
+Example: Run AutoLLM Pipeline
+Demonstrates how to use the AutoLLM system
 """
 
 from automl import AutoMLPipeline
@@ -9,11 +9,11 @@ import sys
 
 def main():
     """
-    Example usage of AutoML pipeline
+    Example usage of AutoLLM pipeline
     """
     
     # Initialize pipeline
-    pipeline = AutoMLPipeline(output_dir="experiments")
+    pipeline = AutoLLMPipeline(output_dir="experiments")
     
     # Example 1: With explicit column names
     # Uncomment and modify with your CSV path
@@ -32,7 +32,7 @@ def main():
     # )
     
     print("╔" + "="*68 + "╗")
-    print("║" + " "*15 + "AutoML Pipeline Example" + " "*31 + "║")
+    print("║" + " "*15 + "AutoLLM Pipeline Example" + " "*30 + "║")
     print("╚" + "="*68 + "╝")
     
     print("\n📋 To get started:\n")
@@ -42,9 +42,9 @@ def main():
     print()
     print("2. Run the pipeline:")
     print()
-    print("   from automl import AutoMLPipeline")
+    print("   from automl import AutoLLMPipeline")
     print()
-    print("   pipeline = AutoMLPipeline(output_dir='experiments')")
+    print("   pipeline = AutoLLMPipeline(output_dir='experiments')")
     print()
     print("   result = pipeline.run(")
     print("       csv_path='data/your_data.csv',")
