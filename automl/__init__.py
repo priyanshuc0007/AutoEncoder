@@ -1,18 +1,22 @@
 """
-AutoML Package
-Automated Machine Learning for Text Classification
+AutoLLM Package
+Automated Fine-Tuning Pipeline for Text Classification
 """
 
-from automl.pipeline import AutoMLPipeline
+from automl.pipeline import AutoLLMPipeline
 from automl.data_validator import DataValidator
 from automl.data_intelligence import DataIntelligence
 from automl.model_trainer import ModelTrainer
 from automl.evaluator import ModelEvaluator
 
-__version__ = "0.1.0"
+# Backwards-compatible alias
+AutoMLPipeline = AutoLLMPipeline
+
+__version__ = "1.0.0"
 
 __all__ = [
-    'AutoMLPipeline',
+    'AutoLLMPipeline',
+    'AutoMLPipeline',  # backwards compat
     'DataValidator',
     'DataIntelligence',
     'ModelTrainer',

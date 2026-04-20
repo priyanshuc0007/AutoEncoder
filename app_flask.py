@@ -6,17 +6,18 @@ import os
 import json
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import threading
 from typing import Dict, Any
 import uuid
 
-from automl import AutoMLPipeline
+from automl import AutoLLMPipeline
 
 # Configure Flask app
 app = Flask(__name__)
-CORS(app)
+# Restrict CORS to localhost only — change origins for production deployment
+CORS(app, origins=["http://localhost:3000", "http://localhost:5000", "http://127.0.0.1:5000"])
 
 # Configuration
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
@@ -32,7 +33,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # In-memory job tracking
-JOBS = {}
+# Jobs are evicted after JOB_TTL to prevent unbounded memory growth.
+JOBS: Dict[str, Any] = {}
+JOB_TTL = timedelta(hours=24)
+
+
+def _evict_old_jobs():
+    """Remove jobs older than JOB_TTL from the in-memory store."""
+    cutoff = datetime.now() - JOB_TTL
+    stale = [
+        jid for jid, job in JOBS.items()
+        if job.created_at < cutoff
+    ]
+    for jid in stale:
+        del JOBS[jid]
+    if stale:
+        logger.info(f"Evicted {len(stale)} stale job(s) from memory")
 
 
 class Job:
@@ -75,7 +91,7 @@ def health_check():
 def pipeline_info():
     """Get pipeline information"""
     return jsonify({
-        'name': 'AutoML Text Classification',
+        'name': 'AutoLLM Text Classification',
         'version': '0.1.0',
         'endpoints': {
             'health': 'GET /health',
@@ -91,13 +107,17 @@ def pipeline_info():
 @app.route('/api/v1/pipeline/run', methods=['POST'])
 def pipeline_run():
     """
-    Start AutoML pipeline
+    Start AutoLLM pipeline
     
     Expected form data:
     - file: CSV file
     - label_column: Name of label column
     - text_column: Name of text column (optional)
     - experiment_name: Experiment name (optional)
+    - use_cv: 'true' to run cross-validation instead of 80/20 split (optional, default false)
+    - cv_folds: Number of CV folds (optional, default 5, min 3, max 10)
+    - use_optuna: 'true' to run Optuna hyperparameter search (optional, default false)
+    - optuna_trials: Number of Optuna trials per model (optional, default 10, min 3, max 20)
     
     Returns: job_id for tracking
     """
@@ -118,6 +138,16 @@ def pipeline_run():
         text_column = request.form.get('text_column')
         experiment_name = request.form.get('experiment_name', 
                                           datetime.now().strftime("%Y%m%d_%H%M%S"))
+        use_cv = request.form.get('use_cv', 'false').lower() == 'true'
+        try:
+            cv_folds = max(3, min(10, int(request.form.get('cv_folds', 5))))
+        except (ValueError, TypeError):
+            return jsonify({'error': 'cv_folds must be an integer between 3 and 10'}), 400
+        use_optuna = request.form.get('use_optuna', 'false').lower() == 'true'
+        try:
+            optuna_trials = max(3, min(20, int(request.form.get('optuna_trials', 10))))
+        except (ValueError, TypeError):
+            return jsonify({'error': 'optuna_trials must be an integer between 3 and 20'}), 400
         
         if not label_column:
             return jsonify({'error': 'label_column parameter required'}), 400
@@ -131,11 +161,12 @@ def pipeline_run():
         # Create job
         job = Job(job_id)
         JOBS[job_id] = job
+        _evict_old_jobs()  # clean up stale jobs on each new submission
         
         # Run pipeline in background
         thread = threading.Thread(
             target=_run_pipeline_job,
-            args=(job_id, filepath, label_column, text_column, experiment_name)
+            args=(job_id, filepath, label_column, text_column, experiment_name, use_cv, cv_folds, use_optuna, optuna_trials)
         )
         thread.daemon = True
         thread.start()
@@ -154,8 +185,10 @@ def pipeline_run():
         return jsonify({'error': str(e)}), 500
 
 
-def _run_pipeline_job(job_id: str, filepath: str, label_column: str, 
-                      text_column: str, experiment_name: str):
+def _run_pipeline_job(job_id: str, filepath: str, label_column: str,
+                      text_column: str, experiment_name: str,
+                      use_cv: bool = False, cv_folds: int = 5,
+                      use_optuna: bool = False, optuna_trials: int = 10):
     """Run pipeline job in background"""
     job = JOBS[job_id]
     
@@ -165,7 +198,7 @@ def _run_pipeline_job(job_id: str, filepath: str, label_column: str,
         job.progress = 10
         
         # Initialize pipeline
-        pipeline = AutoMLPipeline(output_dir=app.config['RESULTS_FOLDER'])
+        pipeline = AutoLLMPipeline(output_dir=app.config['RESULTS_FOLDER'])
         
         job.progress = 20
         
@@ -174,7 +207,11 @@ def _run_pipeline_job(job_id: str, filepath: str, label_column: str,
             csv_path=filepath,
             label_column=label_column,
             text_column=text_column,
-            experiment_name=experiment_name
+            experiment_name=experiment_name,
+            use_cv=use_cv,
+            cv_folds=cv_folds,
+            use_optuna=use_optuna,
+            optuna_trials=optuna_trials,
         )
         
         job.progress = 90
@@ -183,8 +220,11 @@ def _run_pipeline_job(job_id: str, filepath: str, label_column: str,
         if result.get('status') == 'success':
             # Convert non-serializable objects
             result_copy = result.copy()
-            if 'comparison_df' in result_copy:
-                result_copy['comparison_df'] = result_copy['comparison_df'].to_dict()
+            if 'comparison_df' in result_copy and isinstance(result_copy['comparison_df'], pd.DataFrame):
+                df_clean = result_copy['comparison_df'].where(
+                    pd.notna(result_copy['comparison_df']), other=None
+                )
+                result_copy['comparison_df'] = df_clean.to_dict()
             if 'data_analysis' in result_copy:
                 # Simplify analysis for JSON
                 analysis = result_copy['data_analysis']
@@ -272,12 +312,18 @@ def download_report(job_id: str):
     
     try:
         experiment_dir = job.result.get('experiment_dir')
-        report_path = os.path.join(experiment_dir, 'best_model_report.txt')
-        
-        if not os.path.exists(report_path):
+
+        # Guard against path traversal — ensure the resolved path is
+        # still inside the configured results folder.
+        results_root = Path(app.config['RESULTS_FOLDER']).resolve()
+        report_path = Path(os.path.join(experiment_dir, 'best_model_report.txt')).resolve()
+        if not str(report_path).startswith(str(results_root)):
+            return jsonify({'error': 'Invalid experiment path'}), 400
+
+        if not report_path.exists():
             return jsonify({'error': 'Report not found'}), 404
-        
-        return send_file(report_path, as_attachment=True, 
+
+        return send_file(str(report_path), as_attachment=True,
                         download_name=f"report_{job_id}.txt")
     
     except Exception as e:
@@ -327,7 +373,7 @@ def internal_error(error):
 def root():
     """Root endpoint with API documentation"""
     return jsonify({
-        'app': 'AutoML Text Classification API',
+        'app': 'AutoLLM Text Classification API',
         'version': '0.1.0',
         'documentation': 'See /api/v1/pipeline/info for available endpoints',
         'endpoints': {
@@ -344,5 +390,5 @@ def root():
 
 
 if __name__ == '__main__':
-    logger.info("Starting AutoML Flask API...")
+    logger.info("Starting AutoLLM Flask API...")
     app.run(host='0.0.0.0', port=5000, debug=False)

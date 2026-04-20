@@ -9,31 +9,32 @@ from typing import List
 
 
 class TextDataset(Dataset):
-    """PyTorch Dataset for text classification"""
+    """PyTorch Dataset for text classification.
+
+    Pre-tokenizes all texts once at construction time and stores the resulting
+    tensors.  This eliminates redundant tokenizer calls that would otherwise
+    fire on every __getitem__ access — i.e. every sample × every epoch ×
+    every Optuna proxy trial and evaluation pass.
+    """
 
     def __init__(self, texts: List[str], labels: List[int], tokenizer, max_length: int):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
+        # Batch-tokenize the full list once; results are plain tensors stored in
+        # self.encodings.  Each __getitem__ just indexes into them.
+        self.encodings = tokenizer(
+            [str(t) for t in texts],
+            max_length=max_length,
             padding='max_length',
             truncation=True,
-            return_tensors='pt'
+            return_tensors='pt',
         )
+        self.labels = torch.tensor(list(labels), dtype=torch.long)
 
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)
+            'input_ids':      self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
+            'labels':         self.labels[idx],
         }

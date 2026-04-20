@@ -12,12 +12,12 @@ import os
 from datetime import datetime
 import time
 
-# Import AutoML components
-from automl import AutoMLPipeline
+# Import AutoLLM components
+from automl import AutoLLMPipeline
 
 # Page config
 st.set_page_config(
-    page_title="🤖 AutoML Text Classification",
+    page_title="🤖 AutoLLM Text Classification",
     page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -407,16 +407,121 @@ def display_pipeline_results(result):
                 with open(report_path, 'r', encoding='utf-8') as _f:
                     st.text(_f.read())
 
+    # ── Cross-Validation Results ─────────────────────────────────────────────
+    cv = result.get('cv_results')
+    if cv:
+        st.subheader("🔁 Cross-Validation Results")
+        summary = cv.get('summary', {})
+        n_splits = cv.get('n_splits', '?')
+        n_ok = cv.get('n_successful_folds', 0)
+
+        if n_ok < n_splits:
+            st.warning(f"{n_splits - n_ok} fold(s) failed — summary is based on {n_ok} successful fold(s).")
+
+        if summary:
+            f1_s = summary.get('f1', {})
+            acc_s = summary.get('accuracy', {})
+            pre_s = summary.get('precision', {})
+            rec_s = summary.get('recall', {})
+
+            cv1, cv2, cv3, cv4 = st.columns(4)
+            with cv1:
+                st.metric(
+                    "CV F1 (mean ± std)",
+                    f"{f1_s.get('mean', 0):.4f}",
+                    delta=f"± {f1_s.get('std', 0):.4f}",
+                    delta_color="off",
+                    help=(
+                        "Mean F1 across all folds. Low std = stable model. "
+                        "High std = model is sensitive to which samples land in the test fold."
+                    ),
+                )
+            with cv2:
+                st.metric(
+                    "CV Accuracy (mean)",
+                    f"{acc_s.get('mean', 0):.4f}",
+                    delta=f"± {acc_s.get('std', 0):.4f}",
+                    delta_color="off",
+                )
+            with cv3:
+                st.metric("F1 min", f"{f1_s.get('min', 0):.4f}")
+            with cv4:
+                st.metric("F1 max", f"{f1_s.get('max', 0):.4f}")
+
+            # Interpret stability
+            std = f1_s.get('std', 0)
+            mean = f1_s.get('mean', 0)
+            if std <= 0.01:
+                st.success(f"**Stable model** — F1 std={std:.4f}. "
+                           "Performance is consistent across all data splits.")
+            elif std <= 0.03:
+                st.info(f"**Reasonably stable** — F1 std={std:.4f}. "
+                        "Minor variation across folds, acceptable for most tasks.")
+            else:
+                st.warning(
+                    f"**High variance** — F1 std={std:.4f}. "
+                    "Performance varies a lot between folds. "
+                    "Consider collecting more data or using stronger regularisation."
+                )
+
+            # Single-split vs CV comparison
+            single_f1 = result.get('best_model_metrics', {}).get('f1_score')
+            if single_f1 is not None:
+                diff = single_f1 - mean
+                if abs(diff) <= 0.02:
+                    st.success(
+                        f"**Single-split F1 ({single_f1:.4f}) ≈ CV mean ({mean:.4f})** — "
+                        "the original 80/20 split gave a representative estimate."
+                    )
+                elif diff > 0.02:
+                    st.warning(
+                        f"**Single-split F1 ({single_f1:.4f}) > CV mean ({mean:.4f})** — "
+                        "the original split was lucky. "
+                        f"The CV mean ({mean:.4f}) is the more reliable estimate."
+                    )
+                else:
+                    st.info(
+                        f"**Single-split F1 ({single_f1:.4f}) < CV mean ({mean:.4f})** — "
+                        "the original split was conservative. "
+                        f"CV suggests the model is actually stronger ({mean:.4f})."
+                    )
+
+        # Per-fold table
+        fold_data = cv.get('fold_results', [])
+        if fold_data:
+            fold_rows = []
+            for r in fold_data:
+                fold_rows.append({
+                    'Fold':      r['fold'],
+                    'Train Samples': r['n_train'],
+                    'Val Samples':   r['n_val'],
+                    'F1 Score':  f"{r['f1']:.4f}"  if r['f1']  is not None else 'Failed',
+                    'Accuracy':  f"{r['accuracy']:.4f}" if r['accuracy'] is not None else 'Failed',
+                    'Precision': f"{r['precision']:.4f}" if r['precision'] is not None else 'Failed',
+                    'Recall':    f"{r['recall']:.4f}" if r['recall'] is not None else 'Failed',
+                    'Status':    '✅' if r['error'] is None else f"❌ {r.get('error','')[:40]}",
+                })
+            st.markdown("**Per-Fold Breakdown**")
+            st.dataframe(pd.DataFrame(fold_rows), use_container_width=True)
+
+        # Raw text report
+        exp_dir = result.get('experiment_dir', '')
+        cv_report = os.path.join(exp_dir, 'cross_validation_report.txt')
+        if os.path.exists(cv_report):
+            with st.expander("📄 View Full CV Report (text)"):
+                with open(cv_report, 'r', encoding='utf-8') as _f:
+                    st.text(_f.read())
+
 
 # Main app
-st.title("🚀 AutoML Text Classification")
+st.title("🚀 AutoLLM Text Classification")
 st.markdown("**Automated machine learning for text classification tasks**")
 
 # Create tabs
 tab1, tab2, tab3, tab4 = st.tabs(["🏃 Run Pipeline", "📊 Results", "📜 History", "❓ Help"])
 
 with tab1:
-    st.header("Run AutoML Pipeline")
+    st.header("Run AutoLLM Pipeline")
     
     col1, col2 = st.columns([2, 1])
     
@@ -443,6 +548,12 @@ with tab1:
         except UnicodeDecodeError:
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, encoding='latin-1')
+        except Exception:
+            st.error(
+                "❌ Could not parse the uploaded file. "
+                "Please make sure it is a valid CSV (not Excel, JSON, etc.)."
+            )
+            st.stop()
         
         st.subheader("📋 Step 2: Select Columns")
         
@@ -457,7 +568,7 @@ with tab1:
         
         # Detect text columns
         try:
-            from automl.data_validator import DataValidator
+            from automl.data_validator import DataValidator  # autollm package
             validator = DataValidator()
             detected_info = validator.detect_text_columns(df, label_column)
             text_columns_available = detected_info['text_columns']
@@ -517,11 +628,71 @@ with tab1:
         
         with col3:
             pass
+
+        with st.expander("⚙️ Advanced Options"):
+            st.markdown("**Evaluation Strategy**")
+            eval_strategy = st.radio(
+                "Choose how to evaluate model performance:",
+                options=["Train/Test Split (80/20)", "Cross-Validation (K-Fold)"],
+                index=0,
+                help=(
+                    "Train/Test Split: fast, splits 80% training / 20% validation. "
+                    "Cross-Validation: retrains the best model K times on different folds "
+                    "and reports mean ± std metrics — more reliable but K× slower."
+                ),
+            )
+            use_cv = eval_strategy == "Cross-Validation (K-Fold)"
+
+            if use_cv:
+                cv_folds = st.number_input(
+                    "Number of folds",
+                    min_value=3,
+                    max_value=10,
+                    value=5,
+                    step=1,
+                    help="3 folds = faster. 5 folds = more reliable (default). 10 = slowest.",
+                )
+                st.info(
+                    f"⏱️ CV will retrain the best model **{cv_folds} times** on different data splits. "
+                    f"Expect ~{cv_folds}× extra training time."
+                )
+            else:
+                cv_folds = 5  # default, unused
+                st.info("Data will be split **80% training / 20% validation**. Fast and straightforward.")
+
+            st.divider()
+            st.markdown("**Hyperparameter Optimization (Optuna)**")
+            use_optuna = st.checkbox(
+                "Optimize learning rate & weight decay with Optuna",
+                value=False,
+                help=(
+                    "Runs N short proxy trials per model to find the best learning rate "
+                    "and weight decay. Each trial trains for 2 epochs on a small data slice. "
+                    "Automatically skipped on very small datasets (< 50 samples/class)."
+                ),
+            )
+            if use_optuna:
+                optuna_trials = st.number_input(
+                    "Number of trials per model",
+                    min_value=3,
+                    max_value=20,
+                    value=10,
+                    step=1,
+                    help="More trials = better search, but slower. 10 is a good default.",
+                )
+                st.info(
+                    f"⏱️ Optuna will run **{optuna_trials} proxy trials** per model before full training. "
+                    f"Expect ~{optuna_trials * 2} extra epochs of overhead total."
+                )
+            else:
+                optuna_trials = 10  # default, unused
         
         if st.button("🚀 Start Pipeline", type="primary"):
             if selected_text_columns and label_column:
-                # Save uploaded file temporarily
-                temp_path = f"temp_{uploaded_file.name}"
+                # Sanitize filename to prevent path traversal (e.g. ../../module.py)
+                from werkzeug.utils import secure_filename as _sf
+                safe_name = _sf(uploaded_file.name) or "upload.csv"
+                temp_path = f"temp_{safe_name}"
                 with open(temp_path, 'wb') as f:
                     f.write(uploaded_file.getbuffer())
                 
@@ -531,7 +702,7 @@ with tab1:
                 
                 try:
                     # Initialize pipeline
-                    pipeline = AutoMLPipeline(output_dir="experiments")
+                    pipeline = AutoLLMPipeline(output_dir="experiments")
                     
                     # Update progress
                     progress_bar.progress(10)
@@ -542,12 +713,12 @@ with tab1:
                         csv_path=temp_path,
                         label_column=label_column,
                         text_columns=selected_text_columns,
-                        experiment_name=experiment_name
+                        experiment_name=experiment_name,
+                        use_cv=use_cv,
+                        cv_folds=int(cv_folds),
+                        use_optuna=use_optuna,
+                        optuna_trials=int(optuna_trials),
                     )
-                    
-                    # Clean up temp file
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
                     
                     # Update progress
                     progress_bar.progress(100)
@@ -568,6 +739,10 @@ with tab1:
                     st.error(f"❌ Pipeline failed: {str(e)}")
                     progress_bar.progress(0)
                     status_text.text("Failed")
+                finally:
+                    # Always clean up the temp file, even if pipeline raised an exception
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
             
             else:
                 st.warning("⚠️ Please select label column and at least one text column")
@@ -625,7 +800,7 @@ with tab4:
     2. **Select Columns**: Pick which columns contain text and labels
     3. **Run Pipeline**: Click start and wait for results
     
-    The AutoML system will automatically:
+    The AutoLLM system will automatically:
     - Analyze your data
     - Detect class imbalance
     - Select optimal models
@@ -685,6 +860,6 @@ with tab4:
 st.divider()
 st.markdown("""
 <div style='text-align: center; color: gray; font-size: 0.9em;'>
-    🤖 AutoML Text Classification System | Built with Streamlit + PyTorch + HuggingFace
+    🤖 AutoLLM Text Classification System | Built with Streamlit + PyTorch + HuggingFace
 </div>
 """, unsafe_allow_html=True)

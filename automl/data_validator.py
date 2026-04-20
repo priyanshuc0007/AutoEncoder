@@ -1,6 +1,6 @@
 """
 Data Validation Module
-Validates and loads CSV data for AutoML pipeline
+Validates and loads CSV data for AutoLLM pipeline
 """
 
 import pandas as pd
@@ -65,6 +65,21 @@ class DataValidator:
         # Validate label column exists
         if label_column not in df.columns:
             raise ValueError(f"Label column '{label_column}' not found in CSV")
+
+        # Regression guard — run BEFORE dtype conversion so the original numeric
+        # dtype is still visible.  High-cardinality numeric columns (age, price, etc.)
+        # are almost certainly regression targets, not discrete class labels.
+        if pd.api.types.is_numeric_dtype(df[label_column]):
+            num_unique_raw = df[label_column].nunique()
+            cardinality_ratio_raw = num_unique_raw / max(len(df), 1)
+            if num_unique_raw > 20 and cardinality_ratio_raw > 0.2:
+                raise ValueError(
+                    f"Label column '{label_column}' looks like a continuous/regression target: "
+                    f"{num_unique_raw} unique numeric values out of {len(df)} rows "
+                    f"({cardinality_ratio_raw*100:.1f}% cardinality). "
+                    f"This pipeline only supports classification. "
+                    f"If these are genuinely discrete classes, cast the column to string before running."
+                )
 
         # Normalise label column dtype:
         # - Float labels (1.0, 2.0) that are actually integer class IDs → "1", "2"
@@ -313,8 +328,11 @@ class DataValidator:
             logger.warning(f"Could not load tokenizer {tokenizer_name}, using approximate token counting")
             tokenizer = None
         
-        # Create combined column
+        # Create combined column — use a unique name to avoid clobbering any
+        # existing column the user may already have named 'combined_text'.
         combined_column_name = "combined_text"
+        while combined_column_name in df.columns:
+            combined_column_name += "_merged"
         
         def merge_row(row):
             """Merge multiple text columns into one with [SEP] separator"""
