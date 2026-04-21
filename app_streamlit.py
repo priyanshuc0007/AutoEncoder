@@ -110,7 +110,7 @@ def display_pipeline_results(result):
     with col3:
         st.metric("Accuracy", f"{metrics.get('accuracy', 0):.4f}")
     with col4:
-        st.metric("Latency (ms)", f"{metrics.get('latency_ms', 0):.2f}")
+        st.metric("Single-Sample Latency (ms)", f"{metrics.get('single_sample_latency_ms', metrics.get('latency_ms', 0)):.2f}")
 
     # ── Full model comparison ────────────────────────────────────────────────
     st.subheader("📊 Model Comparison")
@@ -129,7 +129,7 @@ def display_pipeline_results(result):
 
         display_cols = [c for c in [
             'Model', 'F1 Score', 'Accuracy', 'Precision', 'Recall',
-            'Latency (ms)', 'Composite Score'
+            'Batch Latency (ms)', 'Single-Sample Latency (ms)', 'Composite Score'
         ] if c in comparison_df.columns]
 
         styled = (
@@ -141,7 +141,8 @@ def display_pipeline_results(result):
                 'Accuracy': '{:.4f}',
                 'Precision': '{:.4f}',
                 'Recall': '{:.4f}',
-                'Latency (ms)': '{:.2f}',
+                'Batch Latency (ms)': '{:.2f}',
+                'Single-Sample Latency (ms)': '{:.2f}',
                 'Composite Score': '{:.4f}',
             })
         )
@@ -164,9 +165,10 @@ def display_pipeline_results(result):
 
             with chart_col2:
                 # Latency bar chart (lower = better)
-                if 'Latency (ms)' in comparison_df.columns:
-                    lat_data = comparison_df.set_index('Model')[['Latency (ms)']]
-                    st.markdown("**Inference Latency (ms) — lower is better**")
+                lat_col = next((c for c in ['Single-Sample Latency (ms)', 'Batch Latency (ms)'] if c in comparison_df.columns), None)
+                if lat_col:
+                    lat_data = comparison_df.set_index('Model')[[lat_col]]
+                    st.markdown(f"**{lat_col} — lower is better**")
                     st.bar_chart(lat_data)
 
             # Detailed per-model cards
@@ -180,20 +182,21 @@ def display_pipeline_results(result):
                     st.markdown(f"**{header}**")
                     if is_best:
                         st.success("Best model")
-                    for col_name in ['F1 Score', 'Accuracy', 'Precision',
-                                     'Recall', 'Latency (ms)', 'Composite Score']:
+                    for col_name in ['F1 Score', 'Accuracy', 'Precision', 'Recall',
+                                     'Batch Latency (ms)', 'Single-Sample Latency (ms)',
+                                     'Composite Score']:
                         if col_name in row:
                             val = row[col_name]
                             try:
-                                fmt = f"{val:.4f}" if col_name != 'Latency (ms)' else f"{val:.2f} ms"
+                                is_latency = 'Latency' in col_name
+                                fmt = f"{val:.2f} ms" if is_latency else f"{val:.4f}"
                             except (TypeError, ValueError):
                                 fmt = str(val) if val is not None else 'N/A'
                             st.write(f"- **{col_name}**: {fmt}")
         else:
             st.info(
-                "Only one model result is stored for this experiment. "
-                "This happens when the experiment was run before multi-model support was added. "
-                "Re-run the pipeline to get a full comparison between **bert-tiny** and **DistilBERT**."
+                "Only one model was trained in this run. "
+                "Select multiple models in Step 2.5 and re-run the pipeline to get a full comparison."
             )
     else:
         st.warning("No comparison data available.")
@@ -258,65 +261,13 @@ def display_pipeline_results(result):
             st.info("No explainability data available. Re-run the pipeline to generate it.")
     else:
         # ── Confidence headline metrics ──────────────────────────────────────
-        ece = conf_stats.get('ece')
         mean_conf = conf_stats.get('mean_confidence')
         low_count = conf_stats.get('low_confidence_count', 0)
         low_pct = conf_stats.get('low_confidence_pct', 0.0)
         threshold = conf_stats.get('low_confidence_threshold', 0.80)
 
-        if ece is not None:
-            if ece < 0.05:
-                cal_label = "Well calibrated ✅"
-                cal_delta_color = "normal"
-                cal_explanation = (
-                    "The model's stated confidence closely matches its actual accuracy. "
-                    "When it says 80% sure, it's right ~80% of the time."
-                )
-            elif ece < 0.10:
-                cal_label = "Acceptable calibration ⚠️"
-                cal_delta_color = "off"
-                cal_explanation = (
-                    "Minor gap between stated confidence and actual accuracy — "
-                    "generally fine for most use cases."
-                )
-            elif isinstance(mean_conf, float) and mean_conf < 0.80:
-                # Under-confident: model predicts correctly but softmax scores are low
-                cal_label = "Under-confident ⚠️"
-                cal_delta_color = "off"
-                cal_explanation = (
-                    "**The model's predictions are correct, but it isn't sure of itself.** "
-                    "It says things like '73% spam' instead of '97% spam'. "
-                    "This is the *safer* miscalibration — predictions are trustworthy, "
-                    "the confidence scores just understate how reliable the model is. "
-                    "Common after fine-tuning on small datasets."
-                )
-            else:
-                cal_label = "Over-confident ❌"
-                cal_delta_color = "inverse"
-                cal_explanation = (
-                    "The model claims high confidence on predictions it gets wrong. "
-                    "Treat its probability scores with caution."
-                )
-        else:
-            cal_label = "N/A"
-            cal_delta_color = "off"
-            cal_explanation = ""
-
-        ec1, ec2, ec3 = st.columns(3)
+        ec1, ec2 = st.columns(2)
         with ec1:
-            st.metric(
-                "ECE (Calibration)",
-                f"{ece:.4f}" if isinstance(ece, float) else "N/A",
-                delta=cal_label,
-                delta_color=cal_delta_color,
-                help=(
-                    "Expected Calibration Error — measures how well the model's "
-                    "confidence scores match its actual accuracy. "
-                    "0 = perfect, 1 = completely wrong. "
-                    "Below 0.05 is excellent, below 0.10 is acceptable."
-                ),
-            )
-        with ec2:
             st.metric(
                 "Mean Confidence",
                 f"{mean_conf:.4f}" if isinstance(mean_conf, float) else "N/A",
@@ -326,7 +277,7 @@ def display_pipeline_results(result):
                     "0.73 means the model said 'I'm 73% sure' on average."
                 ),
             )
-        with ec3:
+        with ec2:
             st.metric(
                 f"Low-Conf Samples (<{threshold})",
                 f"{low_count} ({low_pct:.1f}%)",
@@ -336,9 +287,6 @@ def display_pipeline_results(result):
                     "the model is uncertain. Check Token Importance below for these cases."
                 ),
             )
-
-        if cal_explanation:
-            st.info(f"**What this means:** {cal_explanation}")
 
         # ── Confidence distribution bar chart ────────────────────────────────
         hist = conf_stats.get('confidence_histogram', [])
@@ -355,14 +303,6 @@ def display_pipeline_results(result):
                 "Bars spread across 0.5–0.7 on wrong predictions = over-confident."
             )
             st.bar_chart(hist_df)
-
-        # ── Calibration table ────────────────────────────────────────────────
-        cal_bins = conf_stats.get('calibration_bins', [])
-        if cal_bins:
-            with st.expander("📐 Calibration Detail (ECE bins)"):
-                cal_df = pd.DataFrame(cal_bins)
-                cal_df.columns = [c.replace('_', ' ').title() for c in cal_df.columns]
-                st.dataframe(cal_df, use_container_width=True)
 
         # ── Token importance samples ─────────────────────────────────────────
         if token_expl:
@@ -615,6 +555,73 @@ with tab1:
             st.dataframe(preview_df, width='stretch')
             display_data_preview(df, label_column, selected_text_columns[0])
         
+        # ── Step 2.5: Model selector ─────────────────────────────────────────
+        st.subheader("🤖 Step 2.5: Select Models to Train")
+
+        _MODEL_CATALOG = [
+            {
+                "Model ID": "prajjwal1/bert-tiny",
+                "Params": "4.4 M",
+                "Speed": "⚡⚡⚡⚡",
+                "Best For": "Very small datasets, fastest inference",
+            },
+            {
+                "Model ID": "prajjwal1/bert-mini",
+                "Params": "11 M",
+                "Speed": "⚡⚡⚡",
+                "Best For": "Small datasets, fast iteration",
+            },
+            {
+                "Model ID": "google/mobilebert-uncased",
+                "Params": "25 M",
+                "Speed": "⚡⚡⚡",
+                "Best For": "Latency-critical / mobile deployment",
+            },
+            {
+                "Model ID": "distilbert-base-uncased",
+                "Params": "66 M",
+                "Speed": "⚡⚡",
+                "Best For": "Balanced accuracy and speed",
+            },
+            {
+                "Model ID": "bert-base-uncased",
+                "Params": "110 M",
+                "Speed": "⚡",
+                "Best For": "Best accuracy, large datasets (≥ 10 K samples)",
+            },
+        ]
+        _ALL_MODEL_IDS = [m["Model ID"] for m in _MODEL_CATALOG]
+
+        import pandas as _pd
+        st.dataframe(_pd.DataFrame(_MODEL_CATALOG), use_container_width=True, hide_index=True)
+
+        # Compute auto-selected defaults so they appear pre-checked
+        _auto_selected: list = []
+        if "analysis" in st.session_state and st.session_state["analysis"]:
+            _auto_selected = st.session_state["analysis"].get("model_selection", [])
+        if not _auto_selected:
+            # Fall back to showing all models pre-checked
+            _auto_selected = _ALL_MODEL_IDS
+
+        selected_models = st.multiselect(
+            "Choose which models to train (leave empty to use auto-selection)",
+            options=_ALL_MODEL_IDS,
+            default=[m for m in _auto_selected if m in _ALL_MODEL_IDS],
+            help=(
+                "Auto-selection picks models based on dataset size. "
+                "Pick specific models if you want to control the trade-off between speed and accuracy."
+            ),
+        )
+
+        # Warn if user picks large models for small datasets
+        if selected_models and df is not None:
+            _large = [m for m in selected_models if "bert-base" in m or "distilbert" in m]
+            if _large and len(df) < 2000:
+                st.warning(
+                    f"⚠️ {_large} are large models — your dataset has only {len(df):,} rows. "
+                    "These models may overfit. Consider bert-tiny or bert-mini for small datasets."
+                )
+
         # Start button
         st.subheader("🚀 Step 3: Run Pipeline")
         
@@ -718,6 +725,7 @@ with tab1:
                         cv_folds=int(cv_folds),
                         use_optuna=use_optuna,
                         optuna_trials=int(optuna_trials),
+                        model_names=selected_models if selected_models else None,
                     )
                     
                     # Update progress

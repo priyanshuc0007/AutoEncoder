@@ -270,28 +270,6 @@ def compute_confidence_stats(
     low_conf_mask = confidences < low_confidence_threshold
     low_conf_count = int(low_conf_mask.sum())
 
-    # ── Expected Calibration Error (ECE) with 10 uniform bins ──────────────
-    n_bins = 10
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    ece = 0.0
-    calibration_bins = []
-
-    for i in range(n_bins):
-        mask = (confidences >= bin_edges[i]) & (confidences < bin_edges[i + 1])
-        if mask.sum() == 0:
-            continue
-        bin_conf = float(confidences[mask].mean())
-        bin_acc = float((all_preds_arr[mask] == all_labels_arr[mask]).mean())
-        bin_weight = mask.sum() / len(confidences)
-        ece += bin_weight * abs(bin_conf - bin_acc)
-        calibration_bins.append({
-            "bin": f"{bin_edges[i]:.1f}–{bin_edges[i + 1]:.1f}",
-            "count": int(mask.sum()),
-            "mean_confidence": round(bin_conf, 4),
-            "accuracy": round(bin_acc, 4),
-            "gap": round(bin_conf - bin_acc, 4),
-        })
-
     # Confidence histogram (10 equal-width buckets)
     hist_counts, hist_edges = np.histogram(confidences, bins=10, range=(0.0, 1.0))
     confidence_histogram = [
@@ -312,8 +290,6 @@ def compute_confidence_stats(
         "low_confidence_threshold": low_confidence_threshold,
         "low_confidence_count": low_conf_count,
         "low_confidence_pct": round(float(low_conf_count / len(confidences) * 100), 2),
-        "ece": round(float(ece), 4),
-        "calibration_bins": calibration_bins,
         "confidence_histogram": confidence_histogram,
     }
 
@@ -359,42 +335,6 @@ def save_explainability_report(
         bar_len = int(bucket["count"] / max(cs.get("n_samples", 1), 1) * 40)
         bar = "█" * bar_len
         lines.append(f"  {bucket['range']:<10}  {bucket['count']:>5}  {bar}")
-
-    # ── Calibration ────────────────────────────────────────────────────────
-    ece = cs.get("ece", None)
-    if ece is not None:
-        mean_conf = cs.get("mean_confidence", 0.5)
-        # Determine direction of miscalibration
-        # ECE measures magnitude; we also check whether model is over- or under-confident
-        # by comparing mean confidence against the low-confidence flag pattern
-        if ece < 0.05:
-            cal_label = "WELL CALIBRATED  ✅"
-        elif ece < 0.10:
-            cal_label = "ACCEPTABLE CALIBRATION  ⚠️"
-        elif mean_conf < 0.80:
-            # Under-confident: model is correct but gives low probability scores
-            # This is safer than overconfidence — predictions can still be trusted
-            cal_label = "UNDER-CONFIDENT — model is correct but assigns low probabilities  ⚠️"
-        else:
-            cal_label = "OVER-CONFIDENT — confidence scores may be misleading  ❌"
-
-        lines += [
-            "",
-            sep,
-            "CALIBRATION  (Expected Calibration Error)",
-            sep,
-            f"ECE: {ece:.4f}",
-            f"Diagnosis: {cal_label}",
-            "",
-            f"  {'Bin':<12} {'Count':<7} {'Mean Conf':<12} {'Accuracy':<10} {'Gap':<10} {'Status'}",
-            "  " + "-" * 60,
-        ]
-        for b in cs.get("calibration_bins", []):
-            flag = "✅" if abs(b["gap"]) <= 0.05 else ("⚠️" if abs(b["gap"]) <= 0.10 else "❌")
-            lines.append(
-                f"  {b['bin']:<12} {b['count']:<7} {b['mean_confidence']:<12.4f} "
-                f"{b['accuracy']:<10.4f} {b['gap']:+.4f}  {flag}"
-            )
 
     # ── Token importance ───────────────────────────────────────────────────
     if token_explanations:

@@ -65,6 +65,7 @@ class AutoLLMPipeline:
         cv_folds: int = 5,
         use_optuna: bool = False,
         optuna_trials: int = 10,
+        model_names: Optional[list] = None,
     ) -> Dict:
         """
         Run complete AutoLLM pipeline
@@ -79,6 +80,8 @@ class AutoLLMPipeline:
             cv_folds: Number of CV folds (used only when use_cv=True)
             use_optuna: Whether to run Optuna hyperparameter search (lr + weight_decay)
             optuna_trials: Number of Optuna trials per model (clamped 3–20)
+            model_names: Explicit list of HuggingFace model IDs to train. When provided,
+                         overrides the automatic model selection from DataIntelligence.
             
         Returns:
             Dictionary with pipeline results
@@ -199,8 +202,21 @@ class AutoLLMPipeline:
             except Exception: pass
             logger.info("\n🤖 STEP 4: Model Training")
             logger.info("-" * 70)
+            if model_names is not None:
+                models_to_train = model_names
+                logger.info(f"Using user-selected models: {models_to_train}")
+                dataset_size = len(self.data['train_texts']) + len(self.data['val_texts'])
+                large_models = [m for m in models_to_train if 'bert-base' in m or 'distilbert' in m]
+                if large_models and dataset_size < 2000:
+                    logger.warning(
+                        "⚠️  Large models %s selected for small dataset (%d samples) — may overfit",
+                        large_models, dataset_size,
+                    )
+            else:
+                models_to_train = self.analysis['model_selection']
+                logger.info(f"Auto-selected models: {models_to_train}")
             self.training_results = self.trainer.train_multiple_models(
-                model_names=self.analysis['model_selection'],
+                model_names=models_to_train,
                 data=self.data,
                 hyperparams_ranges=self.analysis['training_config'],
                 max_length=self.analysis['text_info']['p95_length'],
@@ -331,6 +347,8 @@ class AutoLLMPipeline:
                     label_encoder,
                     output_path=str(report_path),
                     train_result=best_train_result,
+                    analysis=self.analysis,
+                    all_results=self.comparison.get('all_results_sorted'),
                 )
             except Exception as e:
                 logger.warning(f"Report generation failed (model still saved): {e}")

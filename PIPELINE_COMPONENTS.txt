@@ -1,0 +1,365 @@
+======================================================================
+AUTOLLM — COMPLETE PIPELINE COMPONENTS REFERENCE
+======================================================================
+Last updated: April 21, 2026
+
+This file describes every component of the AutoLLM project:
+what it does, what it takes as input, what it outputs, and
+how it connects to other components.
+
+======================================================================
+PROJECT ROOT STRUCTURE
+======================================================================
+
+autoencoder/
+│
+├── automl/                     ← Core pipeline package
+│   ├── pipeline.py             ← MAIN ORCHESTRATOR (start here)
+│   ├── data_intelligence.py    ← Decision engine
+│   ├── data_validator.py       ← Input validation
+│   ├── model_trainer.py        ← Training engine
+│   ├── tuner.py                ← Hyperparameter search (Optuna)
+│   ├── evaluator.py            ← Model evaluation & comparison
+│   ├── cross_validator.py      ← K-fold cross-validation
+│   ├── dataset.py              ← PyTorch Dataset wrapper
+│   └── trust/                  ← Transparency & audit layer
+│       ├── decisions_logger.py ← Logs WHY every decision was made
+│       ├── data_quality.py     ← Data quality checks
+│       ├── baseline.py         ← Dummy baseline comparison
+│       ├── explainability.py   ← Token importance + confidence
+│       ├── pipeline_tracker.py ← Step-by-step run tracker
+│       └── reproducibility.py  ← Seed management
+│
+├── app_streamlit.py            ← Web UI (Streamlit)
+├── app_flask.py                ← REST API server (Flask)
+├── api_client.py               ← Python client for Flask API
+├── example.py                  ← Code usage examples
+├── quickstart.py               ← Minimal runnable example
+├── draw_architecture.py        ← Generates architecture diagram
+│
+├── data/                       ← Sample datasets
+├── models/                     ← Saved trained model checkpoints
+└── experiments/                ← Per-run reports and logs
+
+
+======================================================================
+COMPONENT 1 — AutoLLMPipeline   (automl/pipeline.py)
+======================================================================
+CLASS: AutoLLMPipeline
+
+THE MAIN ENTRY POINT. Wires all other components together and runs
+the full pipeline end-to-end in 7 sequential steps.
+
+METHOD: run(
+    csv_path          str                path to your CSV file
+    label_column      str                column containing class labels
+    text_column       str  optional      single text column
+    text_columns      list optional      multiple text columns (merged)
+    experiment_name   str  optional      name for the output folder
+    use_cv            bool default=False run K-fold cross-validation
+    cv_folds          int  default=5     number of CV folds
+    use_optuna        bool default=False run hyperparameter search
+    optuna_trials     int  default=10    how many Optuna trials per model
+    model_names       list optional      override auto model selection
+)
+
+RETURNS: dict with keys —
+    status            'success' or 'failed'
+    best_model_path   path to saved model
+    best_model_name   e.g. 'distilbert-base-uncased'
+    best_model_metrics dict: f1_score, accuracy, latency_ms
+    experiment_name   folder name under experiments/
+    comparison_df     DataFrame: all models ranked by composite score
+
+STEPS EXECUTED:
+    Step 1  Data validation        → data_validator.py
+    Step 2  Data intelligence      → data_intelligence.py  (all decisions)
+    Step 3  Data preparation       → model_trainer.prepare_data()
+    Step 4  Train all models       → model_trainer.train_multiple_models()
+    Step 5  Evaluate all models    → evaluator.evaluate_model()
+    Step 6  Select best model      → evaluator.compare_models()
+    Step 7  Generate reports       → evaluator.generate_report()
+            Trust layer            → trust/ (all 5 pillars)
+
+
+======================================================================
+COMPONENT 2 — DataIntelligence   (automl/data_intelligence.py)
+======================================================================
+CLASS: DataIntelligence
+
+THE DECISION ENGINE. Analyzes the dataset and makes all automated
+choices. No ML training happens here — pure data analysis.
+
+METHOD: analyze(df, label_column, text_column)
+RETURNS: dict with 5 sub-dicts —
+
+    task_info
+        task_type           'binary' or 'multiclass'
+        num_classes         integer
+        class_distribution  dict: {class_name: count}
+
+    imbalance_info
+        imbalance_ratio     majority / minority count
+        use_class_weights   True if ratio > 2.0
+        use_focal_loss      True if ratio > 5.0
+
+    text_info
+        measurement         'real_tokens' or 'char_div4_approx'
+        tokenizer_used      e.g. 'bert-base-uncased'
+        avg_length          average token count (up to 500 sampled texts)
+        p95_length          → used as max_length for training (≤ 512)
+        p95_tokens_raw      real p95 before 512 cap (shows truncation risk)
+        p99_length          99th percentile
+
+    model_selection         list of HuggingFace model IDs
+        < 2,000 samples  → bert-tiny + bert-mini + mobilebert
+        2,000–10,000     → bert-mini + mobilebert + distilbert + bert
+        > 10,000 samples → mobilebert + distilbert + bert
+
+    training_config
+        strategy            'CRITICAL' / 'SMALL' / 'MODERATE' / 'GOOD'
+        num_epochs_range    e.g. [10, 15]
+        batch_size
+        learning_rate
+        weight_decay
+        warmup_steps
+        gradient_accumulation_steps
+        max_grad_norm
+        early_stopping_patience
+
+DECISION RULES SUMMARY:
+    samples/class < 50   → CRITICAL: batch=4,  epochs=[15-20], lr=5e-4
+    samples/class < 200  → SMALL:    batch=8,  epochs=[10-15], lr=2e-4
+    samples/class < 500  → MODERATE: batch=12, epochs=[8-12],  lr=1e-4
+    samples/class ≥ 500  → GOOD:     batch=16, epochs=[5-8],   lr=1e-4
+    imbalance > 10x      → +2 early stopping patience, +20% weight decay
+
+
+======================================================================
+COMPONENT 3 — DataValidator   (automl/data_validator.py)
+======================================================================
+Runs before any analysis. Checks:
+    - CSV file exists and is readable
+    - label_column and text_column present
+    - No completely empty text columns
+    - Label column is not a regression target
+    - Minimum sample count met
+    - Near-duplicate detection
+    - Label inconsistencies (same text, different labels)
+
+OUTPUT: experiments/<run>/data_quality_report.txt
+FAILURE: raises ValueError → pipeline stops early with a clear message
+
+
+======================================================================
+COMPONENT 4 — ModelTrainer   (automl/model_trainer.py)
+======================================================================
+CLASSES:
+    WeightedTrainer(Trainer)    HuggingFace Trainer subclass
+    ModelTrainer                Main training orchestrator
+
+WeightedTrainer.compute_loss()
+    Applies per-class weights and optional focal loss inside loss step.
+    Focal loss formula: FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+
+ModelTrainer.prepare_data(df, label_column, text_column)
+    - Merges text columns if multiple selected
+    - LabelEncoder: 'spam'/'ham' → 0/1
+    - Stratified 80/20 train/val split
+    - Returns: data dict + label_encoder
+
+ModelTrainer.train_multiple_models(model_names, data, hyperparams, ...)
+    For each model:
+        1. Load tokenizer (with override for bert-tiny/bert-mini → bert-base vocab)
+        2. Load pretrained model (with class override for prajjwal models)
+        3. Run Optuna tuning if enabled
+        4. Build TrainingArguments
+        5. Create WeightedTrainer with EarlyStoppingCallback
+        6. trainer.train()
+        7. Save best checkpoint
+    Returns: list of {model_name, model_path, tokenizer, training_time}
+
+TOKENIZER OVERRIDES (models that share bert-base-uncased vocab):
+    prajjwal1/bert-tiny   → bert-base-uncased tokenizer
+    prajjwal1/bert-mini   → bert-base-uncased tokenizer
+
+MODEL CLASS OVERRIDES (need explicit BertForSequenceClassification):
+    prajjwal1/bert-tiny
+    prajjwal1/bert-mini
+
+
+======================================================================
+COMPONENT 5 — HyperparameterTuner   (automl/tuner.py)
+======================================================================
+CLASS: HyperparameterTuner
+
+Uses Optuna (Bayesian optimization) to search for best:
+    - learning_rate    (within lr_bounds from training_config)
+    - weight_decay     (within weight_decay_bounds)
+
+METHOD: tune(model_name, data, base_config, ...)
+    Runs N trials, each training a full model
+    Returns: best_params dict
+
+Search is only triggered when use_optuna=True in pipeline.run()
+Clamped to 3–20 trials regardless of what the user requests.
+
+
+======================================================================
+COMPONENT 6 — ModelEvaluator   (automl/evaluator.py)
+======================================================================
+CLASS: ModelEvaluator
+
+evaluate_model(model_path, texts, labels, tokenizer, ...)
+    Runs inference on the full val set.
+    Measures:
+        - Accuracy, F1, Precision, Recall (weighted)
+        - Batch throughput latency (ms/sample)
+        - Single-sample latency (1 request + tokenization, CUDA-synced)
+    Returns: results dict
+
+compare_models(results_list)
+    Ranks all models by COMPOSITE SCORE:
+        composite = F1 × 0.7  +  speed_bonus × 0.3
+        speed_bonus = 1 / (1 + single_latency / median_latency)
+    Returns: {best_model, all_results_sorted, comparison_df}
+
+generate_report(best_model_result, label_encoder, ...)
+    Writes best_model_report.txt containing:
+        - Train vs Validation metrics (overfitting diagnosis)
+        - Per-class table: Precision / Recall / F1 / Support
+        - Labelled confusion matrix
+        - All models compared table
+        - Decision Transparency section (5 numbered explanations)
+
+
+======================================================================
+COMPONENT 7 — CrossValidator   (automl/cross_validator.py)
+======================================================================
+CLASS: CrossValidator
+
+Runs K-fold cross-validation on the BEST model architecture only.
+Each fold: retrain from scratch on K-1 folds, evaluate on 1 fold.
+Reports: mean ± std for F1, accuracy, precision, recall.
+
+Only runs when use_cv=True in pipeline.run().
+Output saved to experiments/<run>/cv_report.txt
+
+
+======================================================================
+COMPONENT 8 — TextDataset   (automl/dataset.py)
+======================================================================
+CLASS: TextDataset(torch.utils.data.Dataset)
+
+Shared PyTorch dataset wrapper used by both trainer and evaluator.
+Tokenizes texts on the fly (or from pre-tokenized cache).
+Returns: {input_ids, attention_mask, labels}
+
+
+======================================================================
+TRUST LAYER — 5 PILLARS   (automl/trust/)
+======================================================================
+
+PILLAR 1 — Reproducibility   (reproducibility.py)
+    set_global_seeds(seed=42)
+    Sets Python / NumPy / PyTorch / CUDA seeds before every training run.
+    Ensures same data split and weight init on every run with same seed.
+
+PILLAR 2 — Decision Logging   (decisions_logger.py)
+    CLASS: DecisionsLogger
+    Records every automated decision with:
+        category, decision (plain English), reason (numbers), value, alternatives
+    Saved as: experiments/<run>/decisions_log.json
+    Covers: task type, class imbalance, focal loss, token length,
+            model selection, hyperparameter strategy
+
+PILLAR 3 — Data Quality   (data_quality.py)
+    check_data_quality(df, text_column, label_column, experiment_dir)
+    Checks: short texts, near-duplicates, label inconsistencies, tiny classes
+    Saved as: experiments/<run>/data_quality_report.txt
+
+PILLAR 4 — Baseline Comparison   (baseline.py)
+    compute_majority_baseline(val_labels)
+        Computes dummy classifier accuracy (always predicts majority class)
+    save_baseline_comparison(baseline, best_result, ...)
+        Writes baseline_comparison.txt showing F1 / accuracy lift
+    Purpose: confirms the model is actually learning, not just memorising
+             the majority class
+
+PILLAR 5 — Explainability & Reliability   (explainability.py)
+    run_explainability(model_path, tokenizer, val_texts, ...)
+    Runs two analyses:
+        Token Importance:
+            Attention rollout (preferred) or gradient saliency (fallback)
+            Shows which words drove each prediction
+        Confidence Analysis:
+            Mean / median / std of softmax confidence scores
+            Low-confidence sample count (threshold: 0.80)
+    Saved as: experiments/<run>/explainability_report.txt
+
+PILLAR (utility) — Pipeline Tracker   (pipeline_tracker.py)
+    CLASS: PipelineTracker
+    Tracks which step is running, timestamps, and whether it succeeded.
+    Saved as: experiments/<run>/pipeline_state.json
+    Failure anywhere marks the step as failed with an error message.
+
+
+======================================================================
+AVAILABLE MODELS   (5 total)
+======================================================================
+
+Model                       Params   Speed       Best for
+------------------------------------------------------------------
+prajjwal1/bert-tiny         4.4 M    ⚡⚡⚡⚡     Very small datasets, fastest inference
+prajjwal1/bert-mini         11 M     ⚡⚡⚡       Small datasets, fast iteration
+google/mobilebert-uncased   25 M     ⚡⚡⚡       Latency-critical / mobile deployment
+distilbert-base-uncased     66 M     ⚡⚡         Balanced accuracy and speed
+bert-base-uncased           110 M    ⚡           Best accuracy, large datasets
+
+
+======================================================================
+WEB INTERFACES
+======================================================================
+
+Streamlit UI       app_streamlit.py
+    Run:           run_streamlit.bat  (Windows)
+    Features:
+        Step 1     Upload CSV, select label + text columns
+        Step 2     Preview data, auto column detection
+        Step 2.5   Model selector with info table
+        Step 3     Advanced options (CV, Optuna, GPU)
+        Results    Metrics, comparison table, latency charts,
+                   explainability, full report viewer
+
+Flask REST API     app_flask.py
+    Run:           run_flask.bat  (Windows)
+    Endpoints:
+        POST /train          start a training run
+        GET  /status/<id>    check run status
+        POST /predict        run inference on new text
+        GET  /experiments    list past runs
+    Client:        api_client.py  (AutoLLMClient class)
+
+
+======================================================================
+OUTPUT FILES PER EXPERIMENT RUN
+======================================================================
+
+experiments/<timestamp>/
+    decisions_log.json          Every automated decision + reason
+    data_quality_report.txt     Input data health check
+    baseline_comparison.txt     Model vs dummy classifier
+    best_model_report.txt       Full evaluation + per-class metrics
+                                + all models compared
+                                + decision transparency section
+    explainability_report.txt   Token importance + confidence stats
+    pipeline_state.json         Step-by-step run tracker
+    config.pkl                  Saved label encoder + config
+    cv_report.txt               (only if use_cv=True)
+
+models/<timestamp>_<model_name>/
+    config.json                 Model architecture config
+    model.safetensors           Trained weights
+    tokenizer files
+
+======================================================================

@@ -293,15 +293,19 @@ class ModelEvaluator:
         label_encoder,
         output_path: str = "experiments/best_model_report.txt",
         train_result: Dict = None,
+        analysis: Dict = None,
+        all_results: List[Dict] = None,
     ) -> None:
         """
-        Generate evaluation report with optional train vs val comparison.
+        Generate evaluation report.
 
         Args:
             best_model_result: Validation evaluation result (the best model)
-            label_encoder: Label encoder for class names
-            output_path: Where to save report
-            train_result: Training set evaluation result (optional, for overfitting analysis)
+            label_encoder:     Label encoder for class names
+            output_path:       Where to save report
+            train_result:      Training set evaluation result (for overfitting analysis)
+            analysis:          DataIntelligence analysis dict (for decision transparency)
+            all_results:       All model results sorted by score (for full comparison)
         """
         logger.info(f"Generating report to {output_path}")
 
@@ -354,31 +358,228 @@ class ModelEvaluator:
                 f.write(f"  Avg Latency: {best_model_result['avg_inference_time_ms']:.2f}ms per sample\n\n")
 
             # ── Validation classification report ──────────────────────────────
-            f.write("VALIDATION CLASSIFICATION REPORT:\n")
+            f.write("="*70 + "\n")
+            f.write("VALIDATION RESULTS — PER CLASS\n")
+            f.write("="*70 + "\n")
             val_class_report = classification_report(
                 best_model_result['true_labels'],
                 best_model_result['predictions'],
                 target_names=label_encoder.classes_,
-                zero_division=0
+                zero_division=0,
+                output_dict=True,
             )
-            f.write(val_class_report + "\n")
+            # Human-readable per-class table
+            f.write(f"\n{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n")
+            f.write("-" * 54 + "\n")
+            for class_name in label_encoder.classes_:
+                row = val_class_report.get(str(class_name), {})
+                f.write(
+                    f"{str(class_name):<20} "
+                    f"{row.get('precision', 0):>10.4f} "
+                    f"{row.get('recall', 0):>10.4f} "
+                    f"{row.get('f1-score', 0):>10.4f} "
+                    f"{int(row.get('support', 0)):>10}\n"
+                )
+            f.write("-" * 54 + "\n")
+            for avg_key in ['macro avg', 'weighted avg']:
+                row = val_class_report.get(avg_key, {})
+                f.write(
+                    f"{avg_key:<20} "
+                    f"{row.get('precision', 0):>10.4f} "
+                    f"{row.get('recall', 0):>10.4f} "
+                    f"{row.get('f1-score', 0):>10.4f} "
+                    f"{int(row.get('support', 0)):>10}\n"
+                )
+            f.write("\n")
+
+            # Warn when any class has very few val samples
+            small_classes = [
+                (cls, int(val_class_report.get(str(cls), {}).get('support', 0)))
+                for cls in label_encoder.classes_
+                if int(val_class_report.get(str(cls), {}).get('support', 0)) < 50
+            ]
+            if small_classes:
+                f.write("⚠️  SMALL VALIDATION CLASSES (< 50 samples):\n")
+                for cls, n in small_classes:
+                    f.write(f"   {cls}: only {n} samples — metrics for this class are unreliable\n")
+                f.write("\n")
 
             f.write("VALIDATION CONFUSION MATRIX:\n")
-            f.write(str(best_model_result['confusion_matrix']) + "\n")
+            # Labelled confusion matrix
+            cm = best_model_result['confusion_matrix']
+            classes = label_encoder.classes_
+            col_w = max(max(len(str(c)) for c in classes), 6) + 2
+            f.write(" " * (col_w + 2))
+            for c in classes:
+                f.write(f"{str(c):>{col_w}}")
+            f.write("\n")
+            for i, true_cls in enumerate(classes):
+                f.write(f"  {str(true_cls):<{col_w}}")
+                for j in range(len(classes)):
+                    f.write(f"{cm[i][j]:>{col_w}}")
+                f.write("\n")
+            f.write("\n")
 
-            # ── Training classification report (if available) ─────────────────
+            # ── Training results per class (if available) ────────────────────
             if train_result is not None:
-                f.write("\n" + "="*70 + "\n")
-                f.write("TRAINING CLASSIFICATION REPORT:\n")
-                train_class_report = classification_report(
+                f.write("="*70 + "\n")
+                f.write("TRAINING RESULTS — PER CLASS\n")
+                f.write("="*70 + "\n")
+                tr_class_report = classification_report(
                     train_result['true_labels'],
                     train_result['predictions'],
                     target_names=label_encoder.classes_,
-                    zero_division=0
+                    zero_division=0,
+                    output_dict=True,
                 )
-                f.write(train_class_report + "\n")
-
+                f.write(f"\n{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}\n")
+                f.write("-" * 54 + "\n")
+                for class_name in label_encoder.classes_:
+                    row = tr_class_report.get(str(class_name), {})
+                    f.write(
+                        f"{str(class_name):<20} "
+                        f"{row.get('precision', 0):>10.4f} "
+                        f"{row.get('recall', 0):>10.4f} "
+                        f"{row.get('f1-score', 0):>10.4f} "
+                        f"{int(row.get('support', 0)):>10}\n"
+                    )
+                f.write("-" * 54 + "\n")
+                for avg_key in ['macro avg', 'weighted avg']:
+                    row = tr_class_report.get(avg_key, {})
+                    f.write(
+                        f"{avg_key:<20} "
+                        f"{row.get('precision', 0):>10.4f} "
+                        f"{row.get('recall', 0):>10.4f} "
+                        f"{row.get('f1-score', 0):>10.4f} "
+                        f"{int(row.get('support', 0)):>10}\n"
+                    )
+                f.write("\n")
                 f.write("TRAINING CONFUSION MATRIX:\n")
-                f.write(str(train_result['confusion_matrix']) + "\n")
+                tr_cm = train_result['confusion_matrix']
+                f.write(" " * (col_w + 2))
+                for c in classes:
+                    f.write(f"{str(c):>{col_w}}")
+                f.write("\n")
+                for i, true_cls in enumerate(classes):
+                    f.write(f"  {str(true_cls):<{col_w}}")
+                    for j in range(len(classes)):
+                        f.write(f"{tr_cm[i][j]:>{col_w}}")
+                    f.write("\n")
+                f.write("\n")
+
+            # ── All-model comparison (if available) ──────────────────────────
+            if all_results and len(all_results) > 1:
+                f.write("="*70 + "\n")
+                f.write("ALL MODELS COMPARED\n")
+                f.write("="*70 + "\n")
+                f.write(f"\n{'Model':<32} {'F1':>8} {'Accuracy':>10} {'Single(ms)':>12} {'Score':>8}\n")
+                f.write("-" * 74 + "\n")
+                for i, r in enumerate(all_results):
+                    marker = " ← BEST" if i == 0 else ""
+                    single_lat = r.get('single_sample_latency_ms', r.get('avg_inference_time_ms', 0))
+                    f.write(
+                        f"{r.get('model_name', 'Unknown'):<32} "
+                        f"{r['f1_score']:>8.4f} "
+                        f"{r['accuracy']:>10.4f} "
+                        f"{single_lat:>12.2f} "
+                        f"{r.get('composite_score', 0):>8.4f}"
+                        f"{marker}\n"
+                    )
+                f.write("\n")
+
+            # ── Decision Transparency ────────────────────────────────────────
+            if analysis:
+                f.write("="*70 + "\n")
+                f.write("DECISION TRANSPARENCY — WHY THE PIPELINE MADE THESE CHOICES\n")
+                f.write("="*70 + "\n\n")
+
+                # Task
+                task = analysis.get('task_info', {})
+                f.write(f"[1] TASK TYPE: {task.get('task_type', '?').upper()}\n")
+                f.write(f"    → {task.get('num_classes', '?')} unique classes detected.\n")
+                dist = task.get('class_distribution', {})
+                total = sum(dist.values()) if dist else 1
+                for cls, cnt in sorted(dist.items(), key=lambda x: -x[1]):
+                    bar = '█' * int(cnt / total * 30)
+                    f.write(f"    {str(cls):<15} {cnt:>5} samples  ({cnt/total:.1%})  {bar}\n")
+                f.write("\n")
+
+                # Imbalance
+                imb = analysis.get('imbalance_info', {})
+                ratio = imb.get('imbalance_ratio', 1.0)
+                f.write(f"[2] CLASS IMBALANCE: ratio = {ratio:.2f}x\n")
+                if imb.get('use_class_weights'):
+                    f.write(f"    → Class weights ENABLED  (threshold: ratio > 2.0)\n")
+                    f.write(f"    → Why: minority class is under-represented; weighting forces\n")
+                    f.write(f"           the model to pay equal attention to all classes during loss.\n")
+                else:
+                    f.write(f"    → Class weights DISABLED  (ratio ≤ 2.0, classes roughly balanced)\n")
+                if imb.get('use_focal_loss'):
+                    f.write(f"    → Focal loss ENABLED  (threshold: ratio > 5.0)\n")
+                    f.write(f"    → Why: very severe imbalance; focal loss down-weights easy\n")
+                    f.write(f"           majority-class examples so gradients focus on hard minority cases.\n")
+                else:
+                    f.write(f"    → Focal loss DISABLED  (ratio ≤ 5.0; standard cross-entropy sufficient)\n")
+                f.write("\n")
+
+                # Sequence length
+                text_info = analysis.get('text_info', {})
+                measurement = text_info.get('measurement', 'char_div4_approx')
+                tokenizer_used = text_info.get('tokenizer_used')
+                p95_raw = text_info.get('p95_tokens_raw', text_info.get('p95_length', '?'))
+                max_len = text_info.get('p95_length', '?')
+                f.write(f"[3] MAX TOKEN LENGTH: {max_len}\n")
+                if measurement == 'real_tokens':
+                    f.write(f"    → Measured using real tokenizer ({tokenizer_used}) on up to 500 sampled texts.\n")
+                    f.write(f"    → p95 real token count: {p95_raw}  |  "
+                            f"p99: {text_info.get('p99_length', '?')} tokens  |  "
+                            f"avg: {text_info.get('avg_length', 0):.0f} tokens\n")
+                    f.write(f"    → avg text length: {text_info.get('avg_char_length', 0):.0f} chars\n")
+                else:
+                    f.write(f"    → Estimated via char÷4 approximation (tokenizer unavailable).\n")
+                    f.write(f"    → Avg text length: {text_info.get('avg_length', 0):.0f} chars  |  "
+                            f"p99 equivalent: {text_info.get('p99_length', '?')} tokens\n")
+                f.write(f"    → Why: covers 95% of samples without padding cost, caps at 512 (transformer limit).\n")
+                if isinstance(p95_raw, int) and p95_raw > 512:
+                    f.write(f"    ⚠️  p95 token length ({p95_raw}) exceeds 512 — texts are being truncated.\n"
+                            f"       Signals in the tail of long texts (e.g. email footers, links) are lost.\n")
+                elif text_info.get('p95_length', 512) <= 48:
+                    f.write(f"    ⚠️  Token length is very short ({max_len}) — long texts will be heavily truncated.\n"
+                            f"       Important signals in the tail of the text may be dropped.\n")
+                f.write("\n")
+
+                # Model selection
+                models = analysis.get('model_selection', [])
+                config = analysis.get('training_config', {})
+                strategy = config.get('strategy', '?')
+                spc = config.get('samples_per_class', 0)
+                f.write(f"[4] MODEL SELECTION: {strategy} strategy ({spc:.0f} samples/class)\n")
+                for m in models:
+                    f.write(f"    + {m}\n")
+                f.write(f"    → Rule:\n")
+                f.write(f"       < 2 000 samples  → bert-tiny + bert-mini + mobilebert (light models, low overfit risk)\n")
+                f.write(f"       2 000–10 000     → bert-mini + mobilebert + distilbert + bert\n")
+                f.write(f"       > 10 000 samples → mobilebert + distilbert + bert (quality-focused)\n")
+                f.write("\n")
+
+                # Hyperparameters
+                f.write(f"[5] HYPERPARAMETERS ({strategy} strategy)\n")
+                f.write(f"    epochs      : {config.get('num_epochs_range')}\n")
+                f.write(f"    batch size  : {config.get('batch_size')}\n")
+                f.write(f"    learning rate: {config.get('learning_rate')}\n")
+                f.write(f"    weight decay : {config.get('weight_decay')}\n")
+                f.write(f"    grad accum  : {config.get('gradient_accumulation_steps')}\n")
+                f.write(f"    warmup steps: {config.get('warmup_steps')}\n")
+                f.write(f"    early stop  : patience = {config.get('early_stopping_patience')}\n")
+                f.write(f"    → Why these values: driven by samples/class ({spc:.0f}).\n")
+                if strategy == 'CRITICAL':
+                    f.write(f"      CRITICAL (<50 spc): aggressive regularisation to prevent memorisation.\n")
+                elif strategy == 'SMALL':
+                    f.write(f"      SMALL (<200 spc): more epochs + regularisation to squeeze out signal.\n")
+                elif strategy == 'MODERATE':
+                    f.write(f"      MODERATE (<500 spc): standard training with careful monitoring.\n")
+                else:
+                    f.write(f"      GOOD (500+ spc): standard fine-tuning, fewer epochs needed.\n")
+                f.write("\n")
 
         logger.info(f"Report saved to {output_path}")

@@ -124,14 +124,23 @@ class DecisionsLogger:
         # 4. Sequence length -------------------------------------------
         p95 = text_info.get("p95_length", "?")
         avg = text_info.get("avg_length", "?")
+        measurement = text_info.get("measurement", "char_div4_approx")
+        tokenizer_used = text_info.get("tokenizer_used", None)
+        p95_raw = text_info.get("p95_tokens_raw", p95)
+        if measurement == "real_tokens":
+            method_note = (
+                f"Real token counts measured with {tokenizer_used} on up to 500 sampled texts. "
+                f"Raw p95 = {p95_raw} tokens (capped at 512)."
+            )
+        else:
+            method_note = "Estimated via char÷4 approximation (tokenizer unavailable at analysis time)."
         self.log(
             category="sequence_length",
             decision=f"Max token length set to {p95}",
             reason=(
-                f"95th-percentile character length ÷ 4 (≈chars per token), "
-                f"capped at 512 (transformer hard limit). "
-                f"Average text length = {avg:.0f} chars." if isinstance(avg, float) else
-                f"Average text length = {avg} chars."
+                f"{method_note} "
+                f"Average text length = {avg:.0f} tokens." if isinstance(avg, float) else
+                f"{method_note} Average text length = {avg}."
             ),
             value=p95,
         )
@@ -141,6 +150,8 @@ class DecisionsLogger:
         samples_per_class = config.get("samples_per_class", 0)
         all_candidates = [
             "prajjwal1/bert-tiny",
+            "prajjwal1/bert-mini",
+            "google/mobilebert-uncased",
             "distilbert-base-uncased",
             "bert-base-uncased",
         ]
@@ -150,9 +161,9 @@ class DecisionsLogger:
             decision=f"Selected model(s): {', '.join(models)}",
             reason=(
                 f"Strategy = '{strategy}' based on {samples_per_class:.0f} samples/class. "
-                f"Rule: < 2 000 total → bert-tiny + DistilBERT; "
-                f"2 000–10 000 → bert-tiny + DistilBERT + BERT; "
-                f"> 10 000 → DistilBERT + BERT."
+                f"Rule: < 2 000 samples → bert-tiny + bert-mini + mobilebert; "
+                f"2 000–10 000 → bert-mini + mobilebert + distilbert + bert; "
+                f"> 10 000 → mobilebert + distilbert + bert."
             ) if isinstance(samples_per_class, (int, float)) else
             f"Strategy = '{strategy}'. Models: {models}.",
             value=models,

@@ -38,6 +38,7 @@ _TOKENIZER_OVERRIDES = {
     "prajjwal1/bert-mini":   "bert-base-uncased",
     "prajjwal1/bert-small":  "bert-base-uncased",
     "prajjwal1/bert-medium": "bert-base-uncased",
+    # google/mobilebert-uncased has its own tokenizer
 }
 
 _MODEL_CLASS_OVERRIDES = {
@@ -45,6 +46,7 @@ _MODEL_CLASS_OVERRIDES = {
     "prajjwal1/bert-mini":   BertForSequenceClassification,
     "prajjwal1/bert-small":  BertForSequenceClassification,
     "prajjwal1/bert-medium": BertForSequenceClassification,
+    # google/mobilebert-uncased auto-dispatches via AutoModelForSequenceClassification
 }
 
 
@@ -113,6 +115,7 @@ class HyperparameterTuner:
         n_trials = max(3, min(20, n_trials))
         lr_low, lr_high = config.get('lr_bounds', (1e-5, 1e-4))
         wd_low, wd_high = config.get('weight_decay_bounds', (0.0, 0.05))
+        num_epochs_range = config.get('num_epochs_range', [3, 5])
         batch_size = min(config.get('batch_size', 16), 16)  # cap proxy batch at 16
 
         logger.info(f"\n{'='*70}")
@@ -167,6 +170,7 @@ class HyperparameterTuner:
         def objective(trial):
             lr = trial.suggest_float('learning_rate', lr_low, lr_high, log=True)
             wd = trial.suggest_float('weight_decay', wd_low, wd_high)
+            num_epochs = trial.suggest_int('num_epochs', num_epochs_range[0], num_epochs_range[1])
             return self._run_trial(
                 base_model=base_model,
                 train_ds=proxy_train_ds,
@@ -174,6 +178,7 @@ class HyperparameterTuner:
                 num_classes=data['num_classes'],
                 lr=lr,
                 wd=wd,
+                num_epochs=num_epochs,
                 batch_size=batch_size,
                 cw_tensor=cw_tensor,
                 use_focal_loss=use_focal_loss,
@@ -185,19 +190,21 @@ class HyperparameterTuner:
 
             best = study.best_params
             logger.info(
-                f"\n✅ Optuna complete — "
+                f"\n\u2705 Optuna complete \u2014 "
                 f"LR: {best['learning_rate']:.2e}  "
                 f"WD: {best['weight_decay']:.4f}  "
+                f"Epochs: {best['num_epochs']}  "
                 f"(proxy F1: {study.best_value:.4f})"
             )
             logger.info(
-                f"   Rule-based was — "
+                f"   Rule-based was \u2014 "
                 f"LR: {config.get('learning_rate', '?'):.2e}  "
                 f"WD: {config.get('weight_decay', '?'):.4f}"
             )
             return {
                 'learning_rate': best['learning_rate'],
                 'weight_decay':  best['weight_decay'],
+                'num_epochs_range': [best['num_epochs'], best['num_epochs']],
             }
 
         except Exception as e:
@@ -279,13 +286,14 @@ class HyperparameterTuner:
         num_classes: int,
         lr: float,
         wd: float,
+        num_epochs: int,
         batch_size: int,
         cw_tensor,
         use_focal_loss: bool,
     ) -> float:
         """
         Run one Optuna trial. Returns weighted-F1 on proxy val set.
-        Trains for 2 epochs, writes no permanent checkpoints.
+        Trains for num_epochs epochs, writes no permanent checkpoints.
         Uses copy.deepcopy(base_model) — no disk I/O per trial.
         """
         tmp_dir = tempfile.mkdtemp()
@@ -296,7 +304,7 @@ class HyperparameterTuner:
 
             args = TrainingArguments(
                 output_dir=tmp_dir,
-                num_train_epochs=2,
+                num_train_epochs=num_epochs,
                 per_device_train_batch_size=batch_size,
                 per_device_eval_batch_size=batch_size,
                 learning_rate=lr,

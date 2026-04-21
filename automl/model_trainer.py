@@ -22,6 +22,16 @@ MODEL_CLASS_OVERRIDES = {
     "prajjwal1/bert-mini":   BertForSequenceClassification,
     "prajjwal1/bert-small":  BertForSequenceClassification,
     "prajjwal1/bert-medium": BertForSequenceClassification,
+    # google/mobilebert-uncased and distilbert/bert use AutoModelForSequenceClassification fine
+}
+
+# Models that share another model's tokenizer vocab
+_GLOBAL_TOKENIZER_OVERRIDES = {
+    "prajjwal1/bert-tiny":   "bert-base-uncased",
+    "prajjwal1/bert-mini":   "bert-base-uncased",
+    "prajjwal1/bert-small":  "bert-base-uncased",
+    "prajjwal1/bert-medium": "bert-base-uncased",
+    # google/mobilebert-uncased has its own tokenizer
 }
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -151,14 +161,18 @@ class ModelTrainer:
         use_focal_loss: bool = False,
         experiment_name: str = "default",
         gradient_accumulation_steps: int = 1,
-        warmup_steps: int = 500,
+        warmup_ratio: float = 0.06,
         weight_decay: float = 0.01,
         max_grad_norm: float = 1.0,
         early_stopping_patience: int = 3,
+        lr_scheduler_type: str = 'linear',
+        dropout: float = 0.1,
+        focal_gamma: float = 2.0,
+        label_smoothing_factor: float = 0.0,
     ) -> Dict:
         """
         Train a single model with adaptive hyperparameters
-        
+
         Args:
             model_name: HuggingFace model name
             data: Data dictionary from prepare_data()
@@ -170,11 +184,15 @@ class ModelTrainer:
             class_weights: Class weights dictionary
             experiment_name: Name for this training run
             gradient_accumulation_steps: Gradient accumulation steps
-            warmup_steps: Warmup steps
+            warmup_ratio: Fraction of training steps used for warmup
             weight_decay: Weight decay
             max_grad_norm: Max gradient norm for clipping
             early_stopping_patience: Early stopping patience
-            
+            lr_scheduler_type: 'cosine' or 'linear'
+            dropout: Classifier dropout probability
+            focal_gamma: Focal loss gamma (used when use_focal_loss=True)
+            label_smoothing_factor: Label smoothing (0.0 = disabled)
+
         Returns:
             Dictionary with training results
         """
@@ -191,14 +209,8 @@ class ModelTrainer:
         
         # Load tokenizer and model
         logger.info("Loading tokenizer and model...")
-        # prajjwal1/bert-tiny has no tokenizer files — it shares bert-base-uncased vocab
-        TOKENIZER_OVERRIDES = {
-            "prajjwal1/bert-tiny":   "bert-base-uncased",
-            "prajjwal1/bert-mini":   "bert-base-uncased",
-            "prajjwal1/bert-small":  "bert-base-uncased",
-            "prajjwal1/bert-medium": "bert-base-uncased",
-        }
-        tokenizer_name = TOKENIZER_OVERRIDES.get(model_name, model_name)
+        # prajjwal1/* models have no tokenizer files — they share bert-base-uncased vocab
+        tokenizer_name = _GLOBAL_TOKENIZER_OVERRIDES.get(model_name, model_name)
         if tokenizer_name != model_name:
             logger.info(f"Using tokenizer '{tokenizer_name}' for model '{model_name}'")
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -209,7 +221,14 @@ class ModelTrainer:
             model_name,
             num_labels=data['num_classes'],
         ).to(self.device)
-        
+
+        # Apply dropout — set on model config before training starts
+        if hasattr(model.config, 'classifier_dropout') and model.config.classifier_dropout is not None:
+            model.config.classifier_dropout = dropout
+        if hasattr(model.config, 'hidden_dropout_prob'):
+            model.config.hidden_dropout_prob = dropout
+        logger.info(f"Dropout set to {dropout}")
+
         # Create datasets
         train_dataset = TextDataset(
             data['train_texts'],
@@ -217,17 +236,17 @@ class ModelTrainer:
             tokenizer,
             max_length
         )
-        
+
         val_dataset = TextDataset(
             data['val_texts'],
             data['val_labels'],
             tokenizer,
             max_length
         )
-        
+
         # Training arguments with adaptive hyperparameters
         model_output_dir = self.output_dir / f"{experiment_name}_{model_name.split('/')[-1]}"
-        
+
         training_args = TrainingArguments(
             output_dir=str(model_output_dir),
             num_train_epochs=num_epochs,
@@ -236,8 +255,10 @@ class ModelTrainer:
             gradient_accumulation_steps=gradient_accumulation_steps,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
-            warmup_steps=warmup_steps,
+            warmup_ratio=warmup_ratio,
             max_grad_norm=max_grad_norm,
+            lr_scheduler_type=lr_scheduler_type,
+            label_smoothing_factor=label_smoothing_factor,
             eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
@@ -272,8 +293,9 @@ class ModelTrainer:
         if use_custom_loss:
             trainer_kwargs['class_weights_tensor'] = class_weights_tensor
             trainer_kwargs['use_focal_loss'] = use_focal_loss
+            trainer_kwargs['focal_gamma'] = focal_gamma
             if use_focal_loss:
-                logger.info("Using focal loss (gamma=2.0) to handle class imbalance")
+                logger.info(f"Using focal loss (gamma={focal_gamma}) to handle class imbalance")
         trainer = trainer_cls(**trainer_kwargs)
         
         # Train
@@ -391,11 +413,15 @@ class ModelTrainer:
                     learning_rate = merged_config['learning_rate'] * lr_scale
                     batch_size = merged_config['batch_size']
                     gradient_accumulation_steps = merged_config.get('gradient_accumulation_steps', 1)
-                    warmup_steps = merged_config.get('warmup_steps', 500)
+                    warmup_ratio = merged_config.get('warmup_ratio', 0.06)
                     weight_decay = merged_config.get('weight_decay', 0.01)
                     max_grad_norm = merged_config.get('max_grad_norm', 1.0)
                     early_stopping_patience = merged_config.get('early_stopping_patience', 3)
-                    
+                    lr_scheduler_type = merged_config.get('lr_scheduler_type', 'linear')
+                    dropout = merged_config.get('dropout', 0.1)
+                    focal_gamma = merged_config.get('focal_gamma', 2.0)
+                    label_smoothing_factor = merged_config.get('label_smoothing_factor', 0.0)
+
                     try:
                         result = self.train_model(
                             model_name=model_name,
@@ -409,10 +435,14 @@ class ModelTrainer:
                             use_focal_loss=use_focal_loss,
                             experiment_name=experiment_name,
                             gradient_accumulation_steps=gradient_accumulation_steps,
-                            warmup_steps=warmup_steps,
+                            warmup_ratio=warmup_ratio,
                             weight_decay=weight_decay,
                             max_grad_norm=max_grad_norm,
                             early_stopping_patience=early_stopping_patience,
+                            lr_scheduler_type=lr_scheduler_type,
+                            dropout=dropout,
+                            focal_gamma=focal_gamma,
+                            label_smoothing_factor=label_smoothing_factor,
                         )
                         all_results.append(result)
 
