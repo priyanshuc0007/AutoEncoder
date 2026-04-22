@@ -1,6 +1,35 @@
+<div align="center">
+
 # 🚀 AutoLLM — Automated Fine-Tuning Pipeline
 
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-Transformers-FFD21E)](https://huggingface.co/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 A production-grade AutoLLM system that automatically handles the complete machine learning pipeline for text classification tasks.
+
+</div>
+
+---
+
+## 📑 Table of Contents
+
+- [✨ Features](#-features)
+- [📋 Architecture](#-architecture)
+- [🏗️ Project Structure](#️-project-structure)
+- [🚀 Quick Start](#-quick-start)
+- [📊 Pipeline Steps Explained](#-pipeline-steps-explained)
+- [📈 Output Files](#-output-files)
+- [🔧 Configuration & Customization](#-configuration--customization)
+- [💡 Tips for Best Results](#-tips-for-best-results)
+- [🎯 Expected Performance](#-expected-performance)
+- [🐛 Troubleshooting](#-troubleshooting)
+- [📚 Next Steps](#-next-steps-advanced-features)
+- [📝 License](#-license)
+- [🤝 Contributing](#-contributing)
+
+---
 
 ## ✨ Features
 
@@ -27,6 +56,8 @@ A production-grade AutoLLM system that automatically handles the complete machin
 - **Latency Tracking**: Measures inference speed per sample
 - **Intelligent Scoring**: Balances accuracy (70%) and speed (30%)
 - **Detailed Reporting**: Classification reports, confusion matrices
+
+---
 
 ## 📋 Architecture
 
@@ -65,6 +96,8 @@ CSV Input
 Best Model + Report
 ```
 
+---
+
 ## 🏗️ Project Structure
 
 ```
@@ -83,6 +116,25 @@ autoencoder/
 ├── requirements.txt                # Dependencies
 └── README.md                       # This file
 ```
+
+---
+
+## 📦 Requirements
+
+| Package | Version |
+|---------|---------|
+| Python | 3.8+ |
+| PyTorch | 2.0+ |
+| Transformers | 4.30+ |
+| scikit-learn | 1.0+ |
+| pandas | 1.5+ |
+
+Install all dependencies at once:
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## 🚀 Quick Start
 
@@ -132,6 +184,8 @@ print(f"Best model: {result['best_model_name']}")
 print(f"F1 Score: {result['best_model_metrics']['f1_score']:.4f}")
 print(f"Model saved to: {result['best_model_path']}")
 ```
+
+---
 
 ## 📊 Pipeline Steps Explained
 
@@ -201,6 +255,8 @@ print(f"Model saved to: {result['best_model_path']}")
 ✓ Generates final report
 ```
 
+---
+
 ## 📈 Output Files
 
 After running, check `experiments/[timestamp]/`:
@@ -234,6 +290,8 @@ CLASSIFICATION REPORT:
        positive       0.94      0.92      0.93       500
        negative       0.91      0.93      0.92       500
 ```
+
+---
 
 ## 🔧 Configuration & Customization
 
@@ -274,6 +332,8 @@ info = {
 }
 ```
 
+---
+
 ## 💡 Tips for Best Results
 
 ### ✅ Do's
@@ -287,6 +347,8 @@ info = {
 - Have extreme class imbalance (> 10:1)
 - Use <100 total samples
 - Include duplicates or noise
+
+---
 
 ## 🎯 Expected Performance
 
