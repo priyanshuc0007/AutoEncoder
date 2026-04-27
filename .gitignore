@@ -42,3 +42,7 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+# Temporary upload files created by Streamlit pipeline
+temp_*.csv
+temp_*.xlsx

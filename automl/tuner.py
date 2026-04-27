@@ -167,6 +167,23 @@ class HyperparameterTuner:
             logger.warning(f"Optuna skipped — base model load failed: {e}")
             return {}
 
+        # Verify deepcopy works before starting trials — CUDA-pinned tensors can
+        # fail deepcopy, which would crash every trial with a cryptic error.
+        try:
+            _test_copy = copy.deepcopy(base_model)
+            del _test_copy
+        except Exception as e:
+            logger.warning(
+                "Optuna skipped — copy.deepcopy(base_model) failed (%s). "
+                "This can happen with memory-mapped or pinned CUDA tensors. "
+                "Falling back to rule-based config.",
+                e,
+            )
+            del base_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return {}
+
         def objective(trial):
             lr = trial.suggest_float('learning_rate', lr_low, lr_high, log=True)
             wd = trial.suggest_float('weight_decay', wd_low, wd_high)
@@ -222,26 +239,43 @@ class HyperparameterTuner:
 
     def _build_proxy_data(self, data: Dict) -> Optional[Dict]:
         """
-        Build a small stratified proxy slice for fast trials.
+        Build a small proxy slice for fast trials.
 
-        Proxy training : at most 300 samples (min 40), stratified.
+        For single-label: stratified split.
+        For multi-label: random split (StratifiedShuffleSplit does not support
+        multi-output targets).
+
+        Proxy training : at most 300 samples (min 40).
         Proxy validation: at most 200 samples carved from the training set —
                           the real val set is never used here to avoid leakage.
         """
         try:
             train_texts  = data['train_texts']
             train_labels = np.array(data['train_labels'])
+            is_ml = train_labels.ndim == 2  # multi-label: 2-D multi-hot array
 
             n_total       = len(train_texts)
-            n_proxy_val   = max(20, min(200, int(n_total * 0.1)))
-            n_proxy_train = max(40, min(300, int(n_total * 0.3)))
+            n_proxy_val   = max(20, min(500,  int(n_total * 0.1)))   # up to 500 val samples
+            n_proxy_train = max(40, min(2000, int(n_total * 0.3)))   # up to 2 K train samples
 
-            if n_proxy_train + n_proxy_val >= n_total:
-                # Dataset too small — proxy train and val both use all training data
-                proxy_train_texts  = list(train_texts)
-                proxy_train_labels = train_labels.copy()
-                proxy_val_texts    = list(train_texts)
-                proxy_val_labels   = train_labels.copy()
+            if n_proxy_train + n_proxy_val >= n_total or is_ml:
+                if is_ml:
+                    # Random split for multi-label
+                    import random
+                    rng = random.Random(0)
+                    idx = list(range(n_total))
+                    rng.shuffle(idx)
+                    pv_idx = idx[:n_proxy_val]
+                    pt_idx = idx[n_proxy_val:n_proxy_val + n_proxy_train]
+                    proxy_val_texts    = [train_texts[i] for i in pv_idx]
+                    proxy_val_labels   = train_labels[pv_idx]
+                    proxy_train_texts  = [train_texts[i] for i in pt_idx]
+                    proxy_train_labels = train_labels[pt_idx]
+                else:
+                    proxy_train_texts  = list(train_texts)
+                    proxy_train_labels = train_labels.copy()
+                    proxy_val_texts    = list(train_texts)
+                    proxy_val_labels   = train_labels.copy()
             else:
                 # Step 1: carve out proxy val from train (stratified, no real val touched)
                 sss_pv = StratifiedShuffleSplit(n_splits=1, test_size=n_proxy_val, random_state=0)
@@ -351,7 +385,10 @@ class HyperparameterTuner:
 
         except Exception as e:
             logger.debug(f"Trial failed: {e}")
-            return 0.0
+            # Raise TrialPruned so Optuna marks this trial as invalid and
+            # never treats 0.0 as a perfect score or picks these params.
+            import optuna as _optuna
+            raise _optuna.TrialPruned() from e
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

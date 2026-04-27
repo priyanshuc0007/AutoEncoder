@@ -30,9 +30,9 @@ autoencoder/
 │       ├── pipeline_tracker.py ← Step-by-step run tracker
 │       └── reproducibility.py  ← Seed management
 │
-├── app_streamlit.py            ← Web UI (Streamlit)
-├── app_flask.py                ← REST API server (Flask)
-├── api_client.py               ← Python client for Flask API
+├── app_streamlit.py            ← Demo UI (Streamlit)
+├── train.py                    ← CLI training script
+├── predict.py                  ← CLI inference script
 ├── example.py                  ← Code usage examples
 ├── quickstart.py               ← Minimal runnable example
 ├── draw_architecture.py        ← Generates architecture diagram
@@ -318,27 +318,48 @@ bert-base-uncased           110 M    ⚡           Best accuracy, large datasets
 
 
 ======================================================================
-WEB INTERFACES
+INTERFACES
 ======================================================================
 
-Streamlit UI       app_streamlit.py
+CLI Training       train.py
+    Usage:         python train.py --file data.csv --label sentiment
+    Options:
+        --file         CSV or XLSX dataset path
+        --label        label column name
+        --text         single text column (auto-detected if omitted)
+        --text-columns merge multiple text columns
+        --models       pin specific HuggingFace model IDs
+        --optuna       Bayesian hyperparameter search
+        --optuna-trials  number of Optuna trials (default 10)
+        --cv           K-fold cross-validation on best model
+        --cv-folds     number of folds (default 5)
+        --output-dir   where to save experiments (default experiments/)
+        --name         custom experiment name
+    Output:        prints model comparison table + latency;
+                   tells user exact predict.py command to run next
+
+CLI Inference      predict.py
+    Usage:         python predict.py --experiment experiments/<run> --text "..."
+    Options:
+        --experiment   experiment folder (loads best model + label encoder)
+        --model        specific model folder override
+        --text         single text to classify
+        --file         CSV or XLSX for batch prediction
+        --text-column  text column in the input file (auto-detected if omitted)
+        --output       save predictions to CSV
+        --batch-size   inference batch size (default 32)
+        --top-k        show top-K classes with confidence (default 1)
+
+Streamlit Demo UI  app_streamlit.py
     Run:           run_streamlit.bat  (Windows)
+                   bash run_streamlit.sh  (macOS/Linux)
     Features:
-        Step 1     Upload CSV, select label + text columns
+        Step 1     Upload CSV/XLSX, select label + text columns
         Step 2     Preview data, auto column detection
         Step 2.5   Model selector with info table
         Step 3     Advanced options (CV, Optuna, GPU)
         Results    Metrics, comparison table, latency charts,
                    explainability, full report viewer
-
-Flask REST API     app_flask.py
-    Run:           run_flask.bat  (Windows)
-    Endpoints:
-        POST /train          start a training run
-        GET  /status/<id>    check run status
-        POST /predict        run inference on new text
-        GET  /experiments    list past runs
-    Client:        api_client.py  (AutoLLMClient class)
 
 
 ======================================================================

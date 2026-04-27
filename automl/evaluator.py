@@ -38,12 +38,13 @@ class ModelEvaluator:
         self,
         model_path: str,
         texts: List[str],
-        labels: List[int],
+        labels,
         tokenizer,
         max_length: int,
         batch_size: int = 32,
         label_encoder = None,
         split: str = 'val',
+        is_multi_label: bool = False,
     ) -> Dict:
         """
         Evaluate a single model
@@ -100,8 +101,12 @@ class ModelEvaluator:
                 inference_times.append(inference_time)
                 
                 logits = outputs.logits
-                preds = torch.argmax(logits, dim=1).cpu().numpy()
-                
+                if is_multi_label:
+                    probs = torch.sigmoid(logits)
+                    preds = (probs > 0.5).int().cpu().numpy()
+                else:
+                    preds = torch.argmax(logits, dim=1).cpu().numpy()
+
                 all_preds.extend(preds)
                 all_labels.extend(batch_labels.cpu().numpy())
         
@@ -129,6 +134,9 @@ class ModelEvaluator:
                 torch.cuda.synchronize()
             # Timed single-sample runs
             for _txt in texts[:_n_timing]:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _t0 = time.time()
                 _enc = tokenizer(
                     str(_txt),
                     max_length=max_length,
@@ -138,9 +146,6 @@ class ModelEvaluator:
                 )
                 _ids  = _enc['input_ids'].to(self.device)
                 _mask = _enc['attention_mask'].to(self.device)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _t0 = time.time()
                 _ = model(input_ids=_ids, attention_mask=_mask)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -151,12 +156,18 @@ class ModelEvaluator:
 
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
-        
+
         # Calculate metrics
-        accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-        precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
-        recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+        if is_multi_label:
+            accuracy = accuracy_score(all_labels, all_preds)  # subset (exact-match)
+            f1 = f1_score(all_labels, all_preds, average='micro', zero_division=0)
+            precision = precision_score(all_labels, all_preds, average='micro', zero_division=0)
+            recall = recall_score(all_labels, all_preds, average='micro', zero_division=0)
+        else:
+            accuracy = accuracy_score(all_labels, all_preds)
+            f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+            precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+            recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
 
         # Weighted mean: weight each batch by its actual sample count to avoid
         # the final (smaller) batch skewing the per-sample latency estimate
@@ -180,7 +191,7 @@ class ModelEvaluator:
             'single_sample_latency_ms': single_sample_latency_ms,  # real single-request latency
             'predictions': all_preds,
             'true_labels': all_labels,
-            'confusion_matrix': confusion_matrix(all_labels, all_preds),
+            'confusion_matrix': None if is_multi_label else confusion_matrix(all_labels, all_preds),
         }
         
         logger.info(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
@@ -295,6 +306,7 @@ class ModelEvaluator:
         train_result: Dict = None,
         analysis: Dict = None,
         all_results: List[Dict] = None,
+        is_multi_label: bool = False,
     ) -> None:
         """
         Generate evaluation report.
@@ -404,21 +416,21 @@ class ModelEvaluator:
                     f.write(f"   {cls}: only {n} samples — metrics for this class are unreliable\n")
                 f.write("\n")
 
-            f.write("VALIDATION CONFUSION MATRIX:\n")
-            # Labelled confusion matrix
-            cm = best_model_result['confusion_matrix']
-            classes = label_encoder.classes_
-            col_w = max(max(len(str(c)) for c in classes), 6) + 2
-            f.write(" " * (col_w + 2))
-            for c in classes:
-                f.write(f"{str(c):>{col_w}}")
-            f.write("\n")
-            for i, true_cls in enumerate(classes):
-                f.write(f"  {str(true_cls):<{col_w}}")
-                for j in range(len(classes)):
-                    f.write(f"{cm[i][j]:>{col_w}}")
+            if not is_multi_label:
+                f.write("VALIDATION CONFUSION MATRIX:\n")
+                cm = best_model_result['confusion_matrix']
+                classes = label_encoder.classes_
+                col_w = max(max(len(str(c)) for c in classes), 6) + 2
+                f.write(" " * (col_w + 2))
+                for c in classes:
+                    f.write(f"{str(c):>{col_w}}")
                 f.write("\n")
-            f.write("\n")
+                for i, true_cls in enumerate(classes):
+                    f.write(f"  {str(true_cls):<{col_w}}")
+                    for j in range(len(classes)):
+                        f.write(f"{cm[i][j]:>{col_w}}")
+                    f.write("\n")
+                f.write("\n")
 
             # ── Training results per class (if available) ────────────────────
             if train_result is not None:
@@ -454,18 +466,21 @@ class ModelEvaluator:
                         f"{int(row.get('support', 0)):>10}\n"
                     )
                 f.write("\n")
-                f.write("TRAINING CONFUSION MATRIX:\n")
-                tr_cm = train_result['confusion_matrix']
-                f.write(" " * (col_w + 2))
-                for c in classes:
-                    f.write(f"{str(c):>{col_w}}")
-                f.write("\n")
-                for i, true_cls in enumerate(classes):
-                    f.write(f"  {str(true_cls):<{col_w}}")
-                    for j in range(len(classes)):
-                        f.write(f"{tr_cm[i][j]:>{col_w}}")
+                if not is_multi_label:
+                    f.write("TRAINING CONFUSION MATRIX:\n")
+                    tr_cm = train_result['confusion_matrix']
+                    _classes = label_encoder.classes_
+                    _col_w = max(max(len(str(c)) for c in _classes), 6) + 2
+                    f.write(" " * (_col_w + 2))
+                    for c in _classes:
+                        f.write(f"{str(c):>{_col_w}}")
                     f.write("\n")
-                f.write("\n")
+                    for i, true_cls in enumerate(_classes):
+                        f.write(f"  {str(true_cls):<{_col_w}}")
+                        for j in range(len(_classes)):
+                            f.write(f"{tr_cm[i][j]:>{_col_w}}")
+                        f.write("\n")
+                    f.write("\n")
 
             # ── All-model comparison (if available) ──────────────────────────
             if all_results and len(all_results) > 1:

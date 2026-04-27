@@ -63,11 +63,12 @@ def compute_token_importance(
     model,
     tokenizer,
     texts: List[str],
-    labels: List[int],
+    labels,
     max_length: int,
     device,
     label_encoder=None,
     n_samples: int = 10,
+    is_multi_label: bool = False,
 ) -> List[Dict]:
     """
     Compute per-token importance for up to *n_samples* validation texts.
@@ -179,24 +180,57 @@ def compute_token_importance(
             word_scores = _merge_subwords(filtered_tokens, scores_arr)
             word_scores_sorted = sorted(word_scores, key=lambda x: x[1], reverse=True)
 
-            # Predicted class
-            pred_idx = int(torch.argmax(outputs.logits, dim=1).item())
-            if label_encoder is not None:
-                try:
-                    predicted_str = label_encoder.inverse_transform([pred_idx])[0]
-                    actual_str = label_encoder.inverse_transform([label])[0]
-                except Exception:
+            # Predicted class / labels
+            if is_multi_label:
+                probs_row = torch.sigmoid(outputs.logits[0]).cpu().numpy()
+                pred_indices = [int(i) for i, p in enumerate(probs_row) if p >= 0.5]
+                if label_encoder is not None:
+                    try:
+                        n_cls = len(label_encoder.classes_)
+                        indicator = [0] * n_cls
+                        for idx in pred_indices:
+                            if idx < n_cls:
+                                indicator[idx] = 1
+                        predicted_str = ", ".join(
+                            label_encoder.inverse_transform([indicator])[0]
+                        ) or "(none)"
+                        # actual: label is a multi-hot row
+                        label_arr = np.array(label)
+                        if label_arr.ndim == 0:
+                            actual_str = str(label)
+                        else:
+                            act_ind = [0] * n_cls
+                            for idx, v in enumerate(label_arr[:n_cls]):
+                                act_ind[idx] = int(v >= 0.5)
+                            actual_str = ", ".join(
+                                label_encoder.inverse_transform([act_ind])[0]
+                            ) or "(none)"
+                    except Exception:
+                        predicted_str = str(pred_indices)
+                        actual_str = str(label)
+                else:
+                    predicted_str = str(pred_indices)
+                    actual_str = str(label)
+                is_correct = predicted_str == actual_str
+            else:
+                pred_idx = int(torch.argmax(outputs.logits, dim=1).item())
+                if label_encoder is not None:
+                    try:
+                        predicted_str = label_encoder.inverse_transform([pred_idx])[0]
+                        actual_str = label_encoder.inverse_transform([label])[0]
+                    except Exception:
+                        predicted_str = str(pred_idx)
+                        actual_str = str(label)
+                else:
                     predicted_str = str(pred_idx)
                     actual_str = str(label)
-            else:
-                predicted_str = str(pred_idx)
-                actual_str = str(label)
+                is_correct = pred_idx == label
 
             results.append({
                 "text": text[:120],
                 "predicted": predicted_str,
                 "actual": actual_str,
-                "correct": pred_idx == label,
+                "correct": is_correct,
                 "word_scores": word_scores_sorted,
                 "top_words": word_scores_sorted[:5],
             })
@@ -215,11 +249,12 @@ def compute_confidence_stats(
     model,
     tokenizer,
     texts: List[str],
-    labels: List[int],
+    labels,
     max_length: int,
     device,
     batch_size: int = 32,
     low_confidence_threshold: float = 0.80,
+    is_multi_label: bool = False,
 ) -> Dict:
     """
     Compute confidence distribution and Expected Calibration Error (ECE).
@@ -256,16 +291,25 @@ def compute_confidence_stats(
             batch_labels = batch["labels"]
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-            preds = np.argmax(probs, axis=1)
 
-            all_probs.extend(probs.tolist())
-            all_preds.extend(preds.tolist())
+            if is_multi_label:
+                # For multi-label: confidence = mean sigmoid prob across active labels
+                probs_mat = torch.sigmoid(outputs.logits).cpu().numpy()  # (B, C)
+                # Use max per-label probability as per-sample confidence proxy
+                batch_confs = probs_mat.max(axis=1).tolist()
+                # Predictions: threshold at 0.5
+                preds_batch = (probs_mat >= 0.5).astype(int).tolist()
+                all_probs.extend([[float(p) for p in row] for row in probs_mat])
+                all_preds.extend(preds_batch)
+            else:
+                probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+                preds = np.argmax(probs, axis=1)
+                all_probs.extend(probs.tolist())
+                all_preds.extend(preds.tolist())
+
             all_labels.extend(batch_labels.numpy().tolist())
 
     confidences = np.array([max(p) for p in all_probs])
-    all_preds_arr = np.array(all_preds)
-    all_labels_arr = np.array(all_labels)
 
     low_conf_mask = confidences < low_confidence_threshold
     low_conf_count = int(low_conf_mask.sum())
@@ -375,12 +419,13 @@ def run_explainability(
     model_path: str,
     tokenizer,
     val_texts: List[str],
-    val_labels: List[int],
+    val_labels,
     max_length: int,
     experiment_dir: Path,
     label_encoder=None,
     n_samples: int = 10,
     low_confidence_threshold: float = 0.80,
+    is_multi_label: bool = False,
 ) -> Dict:
     """
     Main entry point — load best model, run all explainability checks,
@@ -427,10 +472,11 @@ def run_explainability(
             model, tokenizer, val_texts, val_labels,
             max_length, device,
             low_confidence_threshold=low_confidence_threshold,
+            is_multi_label=is_multi_label,
         )
         logger.info(
             f"[Trust/Explainability] Confidence — mean={conf_stats['mean_confidence']}, "
-            f"ECE={conf_stats['ece']}, "
+            f"ECE={conf_stats.get('ece', 'N/A')}, "
             f"low-conf={conf_stats['low_confidence_count']}"
             f"({conf_stats['low_confidence_pct']}%)"
         )
@@ -444,6 +490,7 @@ def run_explainability(
             max_length, device,
             label_encoder=label_encoder,
             n_samples=n_samples,
+            is_multi_label=is_multi_label,
         )
         logger.info(
             f"[Trust/Explainability] Token importance computed for "

@@ -245,10 +245,11 @@ wi_x = out_x
 wi_y = STEP_Y - STEP_H / 2 - 0.190
 box(ax, wi_x, wi_y, 0.106, 0.096,
     C["io"], C["io_edge"], radius=0.010)
-txt(ax, wi_x + 0.050, wi_y + 0.072, "WEB INTERFACES", size=7.5, bold=True, color=C["accent"])
+txt(ax, wi_x + 0.050, wi_y + 0.072, "INTERFACES", size=7.5, bold=True, color=C["accent"])
 for j, line in enumerate([
-    "app_streamlit.py", "app_flask.py", "api_client.py",
-    "run_flask.bat / .sh",
+    "train.py (CLI training)",
+    "predict.py (CLI inference)",
+    "app_streamlit.py (demo UI)",
     "run_streamlit.bat / .sh",
 ]):
     txt(ax, wi_x + 0.050, wi_y + 0.055 - j * 0.014,

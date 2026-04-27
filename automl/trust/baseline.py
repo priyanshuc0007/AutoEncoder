@@ -25,12 +25,14 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-def compute_majority_baseline(labels: List[int]) -> Dict:
+def compute_majority_baseline(labels) -> Dict:
     """
     Compute accuracy and weighted F1 for a majority-class dummy classifier.
+    Handles both single-label (1-D int array) and multi-label (2-D float
+    multi-hot array) cases.
 
     Args:
-        labels: Encoded integer labels from the validation split.
+        labels: Encoded integer labels (1-D) or multi-hot array (2-D).
 
     Returns:
         Dict with keys: strategy, accuracy, f1_score, majority_class_ratio.
@@ -39,6 +41,27 @@ def compute_majority_baseline(labels: List[int]) -> Dict:
     from sklearn.metrics import accuracy_score, f1_score
 
     labels_arr = np.array(labels)
+
+    # ── Multi-label path ───────────────────────────────────────────────────
+    if labels_arr.ndim == 2:
+        # Per-label majority: always predict 1 for each label where
+        # prevalence ≥ 0.5, otherwise always predict 0.
+        n_samples, n_labels = labels_arr.shape
+        per_label_prevalence = labels_arr.mean(axis=0)  # (n_labels,)
+        majority_pred_row = (per_label_prevalence >= 0.5).astype(int)
+        preds = np.tile(majority_pred_row, (n_samples, 1))
+        labels_int = (labels_arr >= 0.5).astype(int)
+
+        return {
+            "strategy": "per_label_majority",
+            "accuracy": float(accuracy_score(labels_int, preds)),
+            "f1_score": float(
+                f1_score(labels_int, preds, average="micro", zero_division=0)
+            ),
+            "majority_class_ratio": float(per_label_prevalence.max()),
+        }
+
+    # ── Single-label path ──────────────────────────────────────────────────
     dummy = DummyClassifier(strategy="most_frequent", random_state=42)
     dummy.fit(labels_arr.reshape(-1, 1), labels_arr)
     preds = dummy.predict(labels_arr.reshape(-1, 1))
@@ -68,14 +91,16 @@ def save_baseline_comparison(
         experiment_dir: Path to the current experiment folder.
         label_encoder : sklearn LabelEncoder (to decode majority class name).
     """
-    # Resolve majority class name
+    # Resolve majority class name (single-label only)
     majority_class_name = None
     true_labels = model_result.get("true_labels")
     if label_encoder is not None and true_labels is not None:
         try:
-            counts = np.bincount(np.array(true_labels))
-            majority_idx = int(np.argmax(counts))
-            majority_class_name = label_encoder.inverse_transform([majority_idx])[0]
+            tl_arr = np.array(true_labels)
+            if tl_arr.ndim == 1:  # single-label only
+                counts = np.bincount(tl_arr.astype(int))
+                majority_idx = int(np.argmax(counts))
+                majority_class_name = label_encoder.inverse_transform([majority_idx])[0]
         except Exception:
             pass
 

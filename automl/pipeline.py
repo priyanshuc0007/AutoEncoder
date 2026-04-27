@@ -61,10 +61,10 @@ class AutoLLMPipeline:
         text_column: Optional[str] = None,
         text_columns: Optional[list] = None,
         experiment_name: Optional[str] = None,
-        use_cv: bool = False,
-        cv_folds: int = 5,
-        use_optuna: bool = False,
-        optuna_trials: int = 10,
+        use_cv: Optional[bool] = None,
+        cv_folds: Optional[int] = None,
+        use_optuna: Optional[bool] = None,
+        optuna_trials: Optional[int] = None,
         model_names: Optional[list] = None,
     ) -> Dict:
         """
@@ -76,10 +76,12 @@ class AutoLLMPipeline:
             text_column: Single text column name (auto-detected if None)
             text_columns: List of text columns to merge (overrides text_column if provided)
             experiment_name: Name for this experiment
-            use_cv: Whether to run cross-validation on the best model
-            cv_folds: Number of CV folds (used only when use_cv=True)
-            use_optuna: Whether to run Optuna hyperparameter search (lr + weight_decay)
-            optuna_trials: Number of Optuna trials per model (clamped 3–20)
+            use_cv: Whether to run cross-validation on the best model.
+                    Pass None (default) to let the pipeline auto-decide based on dataset size.
+            cv_folds: Number of CV folds. None = auto-decided (usually 5).
+            use_optuna: Whether to run Optuna hyperparameter search (lr + weight_decay).
+                        Pass None (default) to let the pipeline auto-decide.
+            optuna_trials: Number of Optuna trials per model. None = auto-decided.
             model_names: Explicit list of HuggingFace model IDs to train. When provided,
                          overrides the automatic model selection from DataIntelligence.
             
@@ -88,9 +90,42 @@ class AutoLLMPipeline:
         """
         if experiment_name is None:
             experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
+        # Sanitize experiment_name: strip path separators and leading dots to
+        # prevent directory traversal (e.g. "../../models/payload").
+        import re as _re
+        experiment_name = _re.sub(r'[\\/]', '_', experiment_name)   # no slashes
+        experiment_name = experiment_name.strip('. ')                # no leading dots/spaces
+        experiment_name = _re.sub(r'[^\w.\-]', '_', experiment_name) # only safe chars
+        if not experiment_name:
+            experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         self.experiment_dir = self.output_dir / experiment_name
-        self.experiment_dir.mkdir(exist_ok=True)
+        # Guard against same-second runs silently overwriting each other.
+        # Append an incrementing suffix until we find a free directory.
+        if self.experiment_dir.exists():
+            _suffix = 2
+            while (self.output_dir / f"{experiment_name}_{_suffix}").exists():
+                _suffix += 1
+            experiment_name = f"{experiment_name}_{_suffix}"
+            self.experiment_dir = self.output_dir / experiment_name
+        self.experiment_dir.mkdir(exist_ok=False)
+
+        # ── File logging: capture ALL module output to pipeline.log ─────────
+        # Attach to the ROOT logger so every sub-module (model_trainer, tuner,
+        # data_intelligence, etc.) is captured automatically.
+        _log_path = self.experiment_dir / "pipeline.log"
+        _file_handler = logging.FileHandler(_log_path, encoding="utf-8")
+        _file_handler.setLevel(logging.DEBUG)  # capture everything including DEBUG
+        _file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logging.getLogger().addHandler(_file_handler)
+        logger.info(f"Pipeline log: {_log_path}")
+        # ────────────────────────────────────────────────────────────────────
 
         # Trust: fix all random seeds + start step tracking
         try:
@@ -110,7 +145,7 @@ class AutoLLMPipeline:
             except Exception: pass
             logger.info("\n📂 STEP 1: Data Validation")
             logger.info("-" * 70)
-            df, label_column, text_column = self.validator.load_and_validate(
+            df, label_column, text_column, is_multi_label = self.validator.load_and_validate(
                 csv_path, label_column, text_column
             )
             
@@ -119,15 +154,37 @@ class AutoLLMPipeline:
             # AND the caller did not explicitly specify text_column.
             detected_columns = self.validator.detect_text_columns(df, label_column)
 
+            # Log any columns excluded for data-leakage risk
+            id_cols = detected_columns.get('id_columns', [])
+            if id_cols:
+                logger.warning(
+                    f"⚠️  Excluded columns (high-cardinality, data leakage risk): {id_cols}"
+                )
+
             # Only fall back to auto-detection when the caller gave neither
             # text_column nor text_columns — an explicit text_column must not
             # be silently replaced by a longer-text column.
             if not text_columns and text_column is None:
                 text_column = detected_columns['primary_text_column']
-                logger.info(f"Using auto-detected primary text column: {text_column}")
+                logger.info(f"Auto-detected primary text column: '{text_column}'")
+
+                # In full-auto mode, also fold in any short categorical features.
+                # Put categoricals FIRST so token-limit truncation hits the long text,
+                # not the short but signal-rich categorical values.
+                cat_cols = detected_columns.get('categorical_columns', [])
+                if cat_cols:
+                    auto_columns = cat_cols + [text_column]
+                    logger.info(
+                        f"Auto-merging categorical features {cat_cols} "
+                        f"with text column '{text_column}' → columns: {auto_columns}"
+                    )
+                    df, text_column = self.validator.merge_text_columns(df, auto_columns)
+                else:
+                    logger.info("No short categorical features found — using primary text column only.")
+
             elif not text_columns:
-                logger.info(f"Using caller-supplied text column: {text_column}")
-            
+                logger.info(f"Using caller-supplied text column: '{text_column}'")
+
             # Validate every entry in text_columns before use
             if text_columns:
                 for col in text_columns:
@@ -135,6 +192,14 @@ class AutoLLMPipeline:
                         raise ValueError(
                             f"text_columns entry '{col}' not found in CSV columns: "
                             f"{list(df.columns)}"
+                        )
+                    # Guard: 100 % null column would produce empty token sequences
+                    null_ratio = df[col].isna().mean()
+                    if null_ratio > 0.95:
+                        raise ValueError(
+                            f"text_columns entry '{col}' is {null_ratio*100:.0f}% null. "
+                            f"Training on empty sequences produces a useless model. "
+                            f"Fix or remove this column before running."
                         )
 
             # If multiple columns specified, merge them
@@ -166,8 +231,36 @@ class AutoLLMPipeline:
             # Step 2: Data intelligence
             logger.info("\n🧠 STEP 2: Data Intelligence Analysis")
             logger.info("-" * 70)
-            self.analysis = self.intelligence.analyze(df, label_column, text_column)
+            self.analysis = self.intelligence.analyze(
+                df, label_column, text_column, is_multi_label=is_multi_label
+            )
             self.intelligence.print_summary(self.analysis)
+
+            # Apply run recommendations when caller passed None (auto-decide mode)
+            _rec = self.analysis.get('run_recommendations', {})
+            if use_cv is None:
+                use_cv     = _rec.get('use_cv', False)
+                cv_folds   = _rec.get('cv_folds', 5)
+                logger.info(
+                    "AUTO CV decision: %s (%d-fold) — %s",
+                    use_cv, cv_folds, _rec.get('cv_reason', ''),
+                )
+            else:
+                cv_folds = cv_folds if cv_folds is not None else 5
+                logger.info("CV decision: %s (%d-fold) — set by caller", use_cv, cv_folds)
+
+            if use_optuna is None:
+                use_optuna    = _rec.get('use_optuna', False)
+                optuna_trials = _rec.get('optuna_trials', 10)
+                logger.info(
+                    "AUTO Optuna decision: %s (%d trials) — %s",
+                    use_optuna, optuna_trials, _rec.get('optuna_reason', ''),
+                )
+            else:
+                optuna_trials = optuna_trials if optuna_trials is not None else 10
+                logger.info(
+                    "Optuna decision: %s (%d trials) — set by caller", use_optuna, optuna_trials
+                )
 
             # Trust: log all automated decisions (saved as decisions_log.json)
             try:
@@ -182,13 +275,14 @@ class AutoLLMPipeline:
             logger.info("\n🔄 STEP 3: Data Preparation")
             logger.info("-" * 70)
             self.data, label_encoder = self.trainer.prepare_data(
-                df, label_column, text_column
+                df, label_column, text_column, is_multi_label=is_multi_label
             )
 
             # Recompute class weights from training labels only — prevents val label
             # distribution from leaking into the training loss via class weight statistics.
+            # For multi-label we use per-label pos_weight computed inside train_model.
             train_class_weights = self.analysis['task_info']['class_weights']  # fallback
-            if self.analysis['imbalance_info']['use_class_weights']:
+            if not is_multi_label and self.analysis['imbalance_info']['use_class_weights']:
                 train_label_strings = pd.Series(
                     label_encoder.inverse_transform(self.data['train_labels'])
                 )
@@ -226,6 +320,7 @@ class AutoLLMPipeline:
                 experiment_name=experiment_name,
                 use_optuna=use_optuna,
                 optuna_trials=optuna_trials,
+                is_multi_label=is_multi_label,
             )
             
             logger.info(f"\n✓ Trained {len(self.training_results)} model(s)")
@@ -261,6 +356,7 @@ class AutoLLMPipeline:
                     max_length=self.analysis['text_info']['p95_length'],
                     label_encoder=label_encoder,
                     split='val',
+                    is_multi_label=is_multi_label,
                 )
 
                 # Merge with training result
@@ -325,6 +421,7 @@ class AutoLLMPipeline:
                     max_length=self.analysis['text_info']['p95_length'],
                     label_encoder=label_encoder,
                     split='train',
+                    is_multi_label=is_multi_label,
                 )
                 best_train_result['model_name'] = best_model_result.get('model_name')
                 logger.info(
@@ -349,13 +446,14 @@ class AutoLLMPipeline:
                     train_result=best_train_result,
                     analysis=self.analysis,
                     all_results=self.comparison.get('all_results_sorted'),
+                    is_multi_label=is_multi_label,
                 )
             except Exception as e:
                 logger.warning(f"Report generation failed (model still saved): {e}")
 
             # Save configuration — non-fatal: fast tokenizers are not always picklable
             try:
-                self._save_configuration(label_encoder)
+                self._save_configuration(label_encoder, is_multi_label)
             except Exception as e:
                 logger.warning(f"Could not save configuration pickle: {e}")
 
@@ -372,6 +470,7 @@ class AutoLLMPipeline:
                     max_length=self.analysis['text_info']['p95_length'],
                     experiment_dir=self.experiment_dir,
                     label_encoder=label_encoder,
+                    is_multi_label=is_multi_label,
                 )
             except Exception as e:
                 logger.warning(f"Explainability step skipped: {e}")
@@ -400,6 +499,7 @@ class AutoLLMPipeline:
                         use_focal_loss=self.analysis['imbalance_info']['use_focal_loss'],
                         n_splits=cv_folds,
                         experiment_name=experiment_name,
+                        is_multi_label=is_multi_label,
                     )
                     # Save CV summary to experiment dir
                     self._save_cv_report(cv_results)
@@ -419,7 +519,16 @@ class AutoLLMPipeline:
             logger.info(f"F1 Score: {best_model_result['f1_score']:.4f}")
             logger.info(f"Experiment saved to: {self.experiment_dir}")
             logger.info(f"{'='*70}\n")
-            
+
+            # ── Detach file handler cleanly after success ────────────────────
+            # Use try/except so a double-remove attempt (edge case) never crashes.
+            try:
+                logging.getLogger().removeHandler(_file_handler)
+                _file_handler.close()
+            except Exception:
+                pass
+            # ────────────────────────────────────────────────────────────────
+
             return {
                 'status': 'success',
                 'experiment_name': experiment_name,
@@ -444,18 +553,28 @@ class AutoLLMPipeline:
             except Exception as _e:
                 logger.debug("[Trust] tracker mark_failed skipped: %s", _e)
             logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
+
+            # ── Detach file handler cleanly after failure too ────────────────
+            try:
+                logging.getLogger().removeHandler(_file_handler)
+                _file_handler.close()
+            except Exception:
+                pass
+            # ────────────────────────────────────────────────────────────────
+
             return {
                 'status': 'failed',
                 'error': str(e),
                 'experiment_name': experiment_name,
             }
     
-    def _save_configuration(self, label_encoder) -> None:
+    def _save_configuration(self, label_encoder, is_multi_label: bool = False) -> None:
         """Save experiment configuration"""
         config = {
             'analysis': self.analysis,
             'training_results': self.training_results,
             'label_encoder': label_encoder,
+            'is_multi_label': is_multi_label,
             'timestamp': datetime.now().isoformat(),
         }
         

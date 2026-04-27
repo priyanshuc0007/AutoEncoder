@@ -114,7 +114,22 @@ def check_data_quality(
     # ------------------------------------------------------------------
     # 4. Tiny classes (< 20 samples)
     # ------------------------------------------------------------------
-    class_counts = df[label_column].value_counts()
+    # For multi-label: count atomic label occurrences, not combination strings.
+    try:
+        from automl.data_validator import DataValidator as _DV
+        parsed = _DV._parse_multi_labels(df[label_column])
+        # If >5% of rows have multiple labels, treat as multi-label
+        multi_label_rows = sum(1 for p in parsed if len(p) > 1)
+        if multi_label_rows / max(len(parsed), 1) > 0.05:
+            from collections import Counter
+            atomic_counts = Counter(
+                label for row in parsed for label in row
+            )
+            class_counts = pd.Series(atomic_counts, name=label_column)
+        else:
+            class_counts = df[label_column].value_counts()
+    except Exception:
+        class_counts = df[label_column].value_counts()
     tiny_classes = class_counts[class_counts < 20].to_dict()
     results["tiny_classes"] = tiny_classes
     for cls, cnt in tiny_classes.items():

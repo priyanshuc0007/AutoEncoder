@@ -17,7 +17,7 @@ class TextDataset(Dataset):
     every Optuna proxy trial and evaluation pass.
     """
 
-    def __init__(self, texts: List[str], labels: List[int], tokenizer, max_length: int):
+    def __init__(self, texts: List[str], labels, tokenizer, max_length: int):
         # Batch-tokenize the full list once; results are plain tensors stored in
         # self.encodings.  Each __getitem__ just indexes into them.
         self.encodings = tokenizer(
@@ -27,7 +27,15 @@ class TextDataset(Dataset):
             truncation=True,
             return_tensors='pt',
         )
-        self.labels = torch.tensor(list(labels), dtype=torch.long)
+        # Handle both single-label (1-D int) and multi-label (2-D float) arrays.
+        import numpy as np
+        labels_arr = np.asarray(labels)
+        if labels_arr.ndim == 2:
+            # Multi-label: multi-hot float matrix of shape (N, num_classes)
+            self.labels = torch.tensor(labels_arr, dtype=torch.float)
+        else:
+            # Single-label: integer class IDs
+            self.labels = torch.tensor(list(labels), dtype=torch.long)
 
     def __len__(self):
         return len(self.labels)

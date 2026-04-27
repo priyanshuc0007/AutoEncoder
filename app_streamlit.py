@@ -71,7 +71,15 @@ def display_data_preview(df, label_col, text_col):
     with col1:
         st.metric("Total Samples", len(df))
     with col2:
-        st.metric("Unique Classes", df[label_col].nunique())
+        # For multi-label data (comma-separated), count unique individual labels
+        _sample = df[label_col].dropna().astype(str)
+        _is_multi = _sample.str.contains(',').any()
+        if _is_multi:
+            _unique_labels = set(lbl.strip() for row in _sample for lbl in row.split(','))
+            _class_count = len(_unique_labels)
+        else:
+            _class_count = df[label_col].nunique()
+        st.metric("Unique Classes", _class_count)
     with col3:
         st.metric("Avg Text Length", int(df[text_col].astype(str).str.len().mean()))
     with col4:
@@ -452,6 +460,21 @@ def display_pipeline_results(result):
                 with open(cv_report, 'r', encoding='utf-8') as _f:
                     st.text(_f.read())
 
+    # ── Training Log ─────────────────────────────────────────────────────────
+    exp_dir = result.get('experiment_dir', '')
+    log_path = os.path.join(exp_dir, 'pipeline.log')
+    if os.path.exists(log_path):
+        st.subheader("📋 Training Log")
+        with st.expander("View full pipeline.log (per-epoch loss, early stopping, errors)", expanded=False):
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as _lf:
+                log_text = _lf.read()
+            # Show last 400 lines so very long logs don't freeze the browser
+            lines = log_text.splitlines()
+            if len(lines) > 400:
+                st.caption(f"Showing last 400 of {len(lines)} lines. Full log at: `{log_path}`")
+                log_text = "\n".join(lines[-400:])
+            st.code(log_text, language=None)
+
 
 # Main app
 st.title("🚀 AutoLLM Text Classification")
@@ -482,6 +505,13 @@ with tab1:
         )
     
     if uploaded_file is not None:
+        # Clear stale analysis from a previous run when the user uploads a different file.
+        # Without this, the Advanced Options expander shows recommendations from the old dataset.
+        _prev_file = st.session_state.get("_uploaded_file_name")
+        if _prev_file != uploaded_file.name:
+            st.session_state["_uploaded_file_name"] = uploaded_file.name
+            st.session_state.pop("analysis", None)   # invalidate stale recommendations
+
         # Load and preview data — handle Windows (cp1252/latin-1) encoded files
         try:
             df = pd.read_csv(uploaded_file, encoding='utf-8')
@@ -624,134 +654,326 @@ with tab1:
 
         # Start button
         st.subheader("🚀 Step 3: Run Pipeline")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            use_gpu = st.checkbox("Use GPU", value=True, help="Use GPU if available")
-        
-        with col2:
-            simulate = st.checkbox("Simulate Run", value=False, help="Skip training (demo mode)")
-        
-        with col3:
-            pass
 
         with st.expander("⚙️ Advanced Options"):
-            st.markdown("**Evaluation Strategy**")
-            eval_strategy = st.radio(
-                "Choose how to evaluate model performance:",
-                options=["Train/Test Split (80/20)", "Cross-Validation (K-Fold)"],
-                index=0,
-                help=(
-                    "Train/Test Split: fast, splits 80% training / 20% validation. "
-                    "Cross-Validation: retrains the best model K times on different folds "
-                    "and reports mean ± std metrics — more reliable but K× slower."
-                ),
-            )
-            use_cv = eval_strategy == "Cross-Validation (K-Fold)"
+            # ── Pull auto-recommendations if a previous analysis exists ──────
+            _prior_analysis = st.session_state.get("analysis", {})
+            _rec = _prior_analysis.get("run_recommendations", {})
+            _has_rec = bool(_rec)
 
-            if use_cv:
-                cv_folds = st.number_input(
-                    "Number of folds",
-                    min_value=3,
-                    max_value=10,
-                    value=5,
-                    step=1,
-                    help="3 folds = faster. 5 folds = more reliable (default). 10 = slowest.",
-                )
+            if _has_rec:
+                st.markdown("**🤖 Auto-Recommendations** *(based on your dataset)*")
+                _cv_icon  = "✅" if _rec.get("use_cv")     else "⏭️"
+                _opt_icon = "✅" if _rec.get("use_optuna") else "⏭️"
                 st.info(
-                    f"⏱️ CV will retrain the best model **{cv_folds} times** on different data splits. "
-                    f"Expect ~{cv_folds}× extra training time."
+                    f"{_cv_icon}  **Cross-Validation:** "
+                    f"{'ON — ' + str(_rec.get('cv_folds', 5)) + '-fold' if _rec.get('use_cv') else 'OFF'}"
+                    f"  —  *{_rec.get('cv_reason', '')}*\n\n"
+                    f"{_opt_icon}  **Optuna tuning:** "
+                    f"{'ON — ' + str(_rec.get('optuna_trials', 10)) + ' trials' if _rec.get('use_optuna') else 'OFF'}"
+                    f"  —  *{_rec.get('optuna_reason', '')}*"
+                )
+                _override = st.checkbox(
+                    "Override recommendations and set manually",
+                    value=False,
+                    key="adv_override",
                 )
             else:
-                cv_folds = 5  # default, unused
-                st.info("Data will be split **80% training / 20% validation**. Fast and straightforward.")
-
-            st.divider()
-            st.markdown("**Hyperparameter Optimization (Optuna)**")
-            use_optuna = st.checkbox(
-                "Optimize learning rate & weight decay with Optuna",
-                value=False,
-                help=(
-                    "Runs N short proxy trials per model to find the best learning rate "
-                    "and weight decay. Each trial trains for 2 epochs on a small data slice. "
-                    "Automatically skipped on very small datasets (< 50 samples/class)."
-                ),
-            )
-            if use_optuna:
-                optuna_trials = st.number_input(
-                    "Number of trials per model",
-                    min_value=3,
-                    max_value=20,
-                    value=10,
-                    step=1,
-                    help="More trials = better search, but slower. 10 is a good default.",
-                )
+                # No analysis for this file yet — pipeline will auto-decide after run
                 st.info(
-                    f"⏱️ Optuna will run **{optuna_trials} proxy trials** per model before full training. "
-                    f"Expect ~{optuna_trials * 2} extra epochs of overhead total."
+                    "🤖 **Auto mode** — CV and Optuna settings will be decided automatically "
+                    "based on your dataset when the pipeline runs. "
+                    "Tick below to set them manually instead."
                 )
+                _override = st.checkbox(
+                    "Set CV / Optuna manually",
+                    value=False,
+                    key="adv_override",
+                )
+
+            # ── Manual / override controls ────────────────────────────────────
+            if _override:
+                st.markdown("**Evaluation Strategy**")
+                eval_strategy = st.radio(
+                    "Choose how to evaluate model performance:",
+                    options=["Train/Test Split (80/20)", "Cross-Validation (K-Fold)"],
+                    index=0,
+                    help=(
+                        "Train/Test Split: fast, splits 80% training / 20% validation. "
+                        "Cross-Validation: retrains the best model K times on different folds "
+                        "and reports mean ± std metrics — more reliable but K× slower."
+                    ),
+                )
+                use_cv = eval_strategy == "Cross-Validation (K-Fold)"
+
+                if use_cv:
+                    cv_folds = st.number_input(
+                        "Number of folds",
+                        min_value=3,
+                        max_value=10,
+                        value=5,
+                        step=1,
+                        help="3 folds = faster. 5 folds = more reliable (default). 10 = slowest.",
+                    )
+                    st.info(
+                        f"⏱️ CV will retrain the best model **{cv_folds} times** on different data splits."
+                    )
+                else:
+                    cv_folds = 5
+                    st.info("Data will be split **80% training / 20% validation**.")
+
+                st.divider()
+                st.markdown("**Hyperparameter Optimization (Optuna)**")
+                use_optuna = st.checkbox(
+                    "Optimize learning rate & weight decay with Optuna",
+                    value=False,
+                    key="adv_use_optuna",
+                    help=(
+                        "Runs N short proxy trials per model to find the best learning rate "
+                        "and weight decay. Each trial trains for 2 epochs on a small data slice."
+                    ),
+                )
+                if use_optuna:
+                    optuna_trials = st.number_input(
+                        "Number of trials per model",
+                        min_value=3,
+                        max_value=20,
+                        value=10,
+                        step=1,
+                        help="More trials = better search, but slower. 10 is a good default.",
+                    )
+                    st.info(
+                        f"⏱️ Optuna will run **{optuna_trials} proxy trials** per model before full training."
+                    )
+                else:
+                    optuna_trials = 10
             else:
-                optuna_trials = 10  # default, unused
+                # Auto mode: pass None so pipeline uses _recommend_run_options()
+                use_cv        = None
+                cv_folds      = None
+                use_optuna    = None
+                optuna_trials = None
         
         if st.button("🚀 Start Pipeline", type="primary"):
             if selected_text_columns and label_column:
+                import threading
+                import re as _re
+
                 # Sanitize filename to prevent path traversal (e.g. ../../module.py)
-                from werkzeug.utils import secure_filename as _sf
-                safe_name = _sf(uploaded_file.name) or "upload.csv"
+                safe_name = _re.sub(r'[^\w.\-]', '_', uploaded_file.name) or "upload.csv"
+                safe_name = safe_name.lstrip('.')
                 temp_path = f"temp_{safe_name}"
                 with open(temp_path, 'wb') as f:
                     f.write(uploaded_file.getbuffer())
-                
-                st.info("⏳ Pipeline starting... This may take a few minutes...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    # Initialize pipeline
-                    pipeline = AutoLLMPipeline(output_dir="experiments")
-                    
-                    # Update progress
-                    progress_bar.progress(10)
-                    status_text.text("📂 Validating data...")
-                    
-                    # Run pipeline with selected text columns
-                    result = pipeline.run(
-                        csv_path=temp_path,
-                        label_column=label_column,
-                        text_columns=selected_text_columns,
-                        experiment_name=experiment_name,
-                        use_cv=use_cv,
-                        cv_folds=int(cv_folds),
-                        use_optuna=use_optuna,
-                        optuna_trials=int(optuna_trials),
-                        model_names=selected_models if selected_models else None,
-                    )
-                    
-                    # Update progress
-                    progress_bar.progress(100)
-                    status_text.text("✅ Complete!")
-                    
-                    # Store results
-                    st.session_state.pipeline_results = result
-                    st.session_state.current_experiment = result
+                    f.flush()
+                    import os as _os
+                    _os.fsync(f.fileno())
 
-                    # Save to history
-                    if result.get('status') == 'success':
-                        save_experiment_to_history(result)
-                        display_pipeline_results(result)
-                    else:
-                        st.error(f"❌ Pipeline failed: {result.get('error', 'Unknown error')}")
-                    
-                except Exception as e:
-                    st.error(f"❌ Pipeline failed: {str(e)}")
-                    progress_bar.progress(0)
-                    status_text.text("Failed")
-                finally:
-                    # Always clean up the temp file, even if pipeline raised an exception
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-            
+                # ── Thread-safe result container ─────────────────────────────
+                _run = {"result": None, "done": False, "error": None}
+
+                def _pipeline_thread():
+                    try:
+                        _pipeline = AutoLLMPipeline(output_dir="experiments")
+                        _run["result"] = _pipeline.run(
+                            csv_path=temp_path,
+                            label_column=label_column,
+                            text_columns=selected_text_columns,
+                            experiment_name=experiment_name,
+                            use_cv=use_cv,
+                            cv_folds=int(cv_folds) if cv_folds is not None else None,
+                            use_optuna=use_optuna,
+                            optuna_trials=int(optuna_trials) if optuna_trials is not None else None,
+                            model_names=selected_models if selected_models else None,
+                        )
+                    except Exception as _e:
+                        _run["error"] = str(_e)
+                    finally:
+                        _run["done"] = True
+
+                _t = threading.Thread(target=_pipeline_thread, daemon=True)
+                _start_time = time.time()
+                _t.start()
+
+                # ── Progress UI placeholders ──────────────────────────────────
+                st.markdown("---")
+                st.markdown("### ⚙️ Pipeline Running")
+                _prog       = st.progress(0)
+                _status_ph  = st.empty()
+                _step_ph    = st.empty()
+                _log_ph     = st.empty()
+
+                # ── Step map: log keyword → (progress %, step label, detail) ──
+                # Ordered from first to last so we pick the highest matched step.
+                _STEP_MAP = [
+                    ("AUTOLLM PIPELINE STARTED",    3,
+                     "🚀 Pipeline started",
+                     "Initialising components and seed..."),
+                    ("STEP 1",                       8,
+                     "📂 Step 1/7 — Data Validation",
+                     "Loading CSV, checking columns, removing duplicates..."),
+                    ("STEP 2",                      20,
+                     "🧠 Step 2/7 — Data Intelligence",
+                     "Measuring class balance, token lengths, picking strategy..."),
+                    ("CRITICAL STRATEGY",            22,
+                     "🧠 Step 2/7 — Strategy: CRITICAL",
+                     "< 50 samples/class — aggressive regularisation mode"),
+                    ("SMALL DATA STRATEGY",          22,
+                     "🧠 Step 2/7 — Strategy: SMALL",
+                     "50–200 samples/class — moderate regularisation"),
+                    ("MODERATE DATA STRATEGY",       22,
+                     "🧠 Step 2/7 — Strategy: MODERATE",
+                     "200–500 samples/class — light regularisation"),
+                    ("GOOD DATA STRATEGY",           22,
+                     "🧠 Step 2/7 — Strategy: GOOD",
+                     ">= 500 samples/class — standard fine-tuning"),
+                    ("STEP 3",                      30,
+                     "🔄 Step 3/7 — Data Preparation",
+                     "Splitting train/val, encoding labels, computing class weights..."),
+                    ("STEP 4",                      36,
+                     "🤖 Step 4/7 — Model Training",
+                     "Loading models and starting fine-tuning..."),
+                    ("Optuna skipped",               37,
+                     "🤖 Step 4/7 — Optuna skipped",
+                     "Too few samples for reliable tuning — using rule-based config"),
+                    ("OPTUNA HYPERPARAMETER SEARCH", 37,
+                     "🔍 Step 4/7 — Optuna search",
+                     "Running short proxy trials to find best lr/weight_decay..."),
+                    ("Using Optuna params",           40,
+                     "🔍 Step 4/7 — Optuna complete",
+                     "Best hyperparameters found, starting full training..."),
+                    ("Starting training",             42,
+                     "🤖 Step 4/7 — Training in progress",
+                     "Fine-tuning model weights epoch by epoch..."),
+                    ("Epoch ",                        None,   # handled specially
+                     None, None),
+                    ("Training completed in",         80,
+                     "🤖 Step 4/7 — Training complete",
+                     "Model saved, moving to next model or evaluation..."),
+                    ("STEP 5",                        85,
+                     "📊 Step 5/7 — Model Evaluation",
+                     "Computing F1, accuracy, latency on validation set..."),
+                    ("STEP 6",                        92,
+                     "🏆 Step 6/7 — Best Model Selection",
+                     "Comparing all models by composite score..."),
+                    ("STEP 7",                        95,
+                     "📋 Step 7/7 — Report Generation",
+                     "Evaluating on train set, checking overfitting, writing report..."),
+                    ("PIPELINE COMPLETED",            99,
+                     "✅ Pipeline complete",
+                     "Wrapping up..."),
+                ]
+
+                _current_pct = 0
+                _current_label = "🚀 Starting pipeline..."
+                _current_detail = "Waiting for first log output..."
+                _log_path = None
+
+                # ── Polling loop — updates UI every 1.5 s until thread ends ──
+                while not _run["done"]:
+                    # Find log file once the experiment directory appears
+                    if _log_path is None:
+                        try:
+                            _exp_base = Path("experiments")
+                            if _exp_base.exists():
+                                _dirs = sorted(
+                                    [d for d in _exp_base.iterdir() if d.is_dir()],
+                                    key=lambda d: d.stat().st_ctime,
+                                    reverse=True,
+                                )
+                                if _dirs and _dirs[0].stat().st_ctime >= _start_time - 3:
+                                    _log_path = _dirs[0] / "pipeline.log"
+                        except Exception:
+                            pass
+
+                    _epoch_line = ""
+                    if _log_path and _log_path.exists():
+                        try:
+                            _log_text  = _log_path.read_text(encoding="utf-8", errors="replace")
+                            _log_lines = _log_text.splitlines()
+
+                            # Walk step map to find highest matched progress
+                            for _keyword, _pct, _label, _detail in _STEP_MAP:
+                                if _keyword == "Epoch ":
+                                    continue  # handled below
+                                if _keyword in _log_text and _pct is not None and _pct > _current_pct:
+                                    _current_pct    = _pct
+                                    _current_label  = _label
+                                    _current_detail = _detail
+
+                            # Interpolate epoch progress (42 % → 80 %)
+                            # Each "Epoch X/Y" line moves the needle inside training range
+                            for _line in reversed(_log_lines):
+                                if "Epoch " in _line and "/" in _line:
+                                    _epoch_line = _line.strip()
+                                    try:
+                                        # Robust epoch parse: match "N/M" anywhere after "Epoch"
+                                        import re as _epoch_re
+                                        _m = _epoch_re.search(r'Epoch\s+(\d+)/(\d+)', _line)
+                                        if _m:
+                                            _cur_ep = int(_m.group(1))
+                                            _tot_ep = int(_m.group(2))
+                                            _ep_pct = 42 + int((_cur_ep / max(_tot_ep, 1)) * 38)
+                                            if _ep_pct > _current_pct:
+                                                _current_pct    = _ep_pct
+                                                _current_label  = f"🤖 Training — epoch {_cur_ep}/{_tot_ep}"
+                                                _current_detail = _line.strip()
+                                    except Exception:
+                                        pass
+                                    break
+
+                            # Last non-HTTP log line for live feed
+                            _last_line = ""
+                            for _line in reversed(_log_lines):
+                                _s = _line.strip()
+                                if _s and "HTTP Request" not in _s and "httpx" not in _s:
+                                    _last_line = _s
+                                    break
+
+                            # Show last 12 lines in the log box (skip HTTP noise)
+                            _clean_lines = [
+                                l for l in _log_lines
+                                if "HTTP Request" not in l and "httpx" not in l
+                            ]
+                            _log_ph.code(
+                                "\n".join(_clean_lines[-12:]) if _clean_lines else "...",
+                                language=None,
+                            )
+                        except Exception:
+                            pass
+
+                    _elapsed = int(time.time() - _start_time)
+                    _prog.progress(min(_current_pct, 99))
+                    _status_ph.markdown(
+                        f"**{_current_label}** &nbsp;|&nbsp; ⏱️ {_elapsed}s elapsed"
+                    )
+                    _step_ph.caption(f"ℹ️ {_current_detail}")
+                    time.sleep(1.5)
+
+                # ── Thread finished ───────────────────────────────────────────
+                result = _run["result"]
+                if _run["error"] and result is None:
+                    result = {"status": "failed", "error": _run["error"]}
+
+                _prog.progress(100)
+                _status_ph.empty()
+                _step_ph.empty()
+                _log_ph.empty()
+
+                # Cleanup temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+                # Store and display results
+                st.session_state.pipeline_results = result
+                st.session_state.current_experiment = result
+                if result.get('status') == 'success':
+                    st.session_state["analysis"] = result.get('data_analysis', {})
+                    save_experiment_to_history(result)
+                    display_pipeline_results(result)
+                else:
+                    st.error(f"❌ Pipeline failed: {result.get('error', 'Unknown error')}")
+
             else:
                 st.warning("⚠️ Please select label column and at least one text column")
 

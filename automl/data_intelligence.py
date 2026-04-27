@@ -16,59 +16,138 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def compute_val_split(n_samples: int) -> float:
+    """
+    Single authoritative val-split ratio — used by both ModelTrainer.prepare_data()
+    and DataIntelligence._recommend_run_options() so estimates are always consistent
+    with what the trainer will actually produce.
+
+    Mirrors the adaptive logic in ModelTrainer:
+      < 200 samples   → 15%  (preserve more training data)
+      > 25 000 samples → cap val at ~5 000 rows (diminishing returns beyond that)
+      otherwise        → 20%
+    """
+    if n_samples < 200:
+        return 0.15
+    elif n_samples > 25000:
+        return max(0.05, 5000.0 / n_samples)
+    else:
+        return 0.20
+
+
 class DataIntelligence:
     """Analyzes dataset and provides intelligence for AutoLLM decisions"""
     
     def __init__(self):
         pass
     
-    def analyze(self, df: pd.DataFrame, label_column: str, text_column: str) -> Dict:
+    def analyze(
+        self,
+        df: pd.DataFrame,
+        label_column: str,
+        text_column: str,
+        is_multi_label: bool = False,
+    ) -> Dict:
         """
         Comprehensive dataset analysis
-        
+
         Args:
             df: DataFrame
             label_column: Label column name
             text_column: Text column name
-            
+            is_multi_label: Whether labels are multi-label (comma/pipe separated)
+
         Returns:
             Dictionary with analysis results
         """
         analysis = {}
-        
+
         # 1. Task Detection
-        analysis['task_info'] = self._detect_task(df, label_column)
-        
+        analysis['task_info'] = self._detect_task(df, label_column, is_multi_label=is_multi_label)
+
         # 2. Class Imbalance Detection
-        analysis['imbalance_info'] = self._detect_imbalance(df, label_column)
-        
+        analysis['imbalance_info'] = self._detect_imbalance(
+            df, label_column, is_multi_label=is_multi_label
+        )
+
         # 3. Text Length Analysis
         analysis['text_info'] = self._analyze_text_length(df, text_column)
-        
+
         # 4. Model Selection
         analysis['model_selection'] = self._select_models(len(df), analysis['imbalance_info'])
-        
+
         # 5. Training Configuration
         analysis['training_config'] = self._get_training_config(
-            len(df), 
+            len(df),
             analysis['imbalance_info'],
             analysis['task_info']
         )
-        
+
+        # 6. Auto-recommend CV and Optuna based on data characteristics
+        # For multi-label: use total label occurrences / num_unique_labels so that
+        # a 200-row dataset with 10 labels and avg 3 labels/row gives ~60 spc (not 20).
+        # For single-label: sum(class_dist) == len(df), so the formula is identical.
+        _total_label_occ = sum(analysis['task_info']['class_distribution'].values())
+        _spc = _total_label_occ / max(analysis['task_info']['num_classes'], 1)
+        analysis['run_recommendations'] = self._recommend_run_options(
+            dataset_size=len(df),
+            samples_per_class=_spc,
+            imbalance_ratio=analysis['imbalance_info']['imbalance_ratio'],
+            strategy=analysis['training_config']['strategy'],
+        )
+
         return analysis
     
-    def _detect_task(self, df: pd.DataFrame, label_column: str) -> Dict:
+    def _detect_task(
+        self,
+        df: pd.DataFrame,
+        label_column: str,
+        is_multi_label: bool = False,
+    ) -> Dict:
         """
-        Detect if task is binary or multiclass
-        
-        Args:
-            df: DataFrame
-            label_column: Label column name
-            
-        Returns:
-            Dictionary with task information
+        Detect task type: binary, multiclass, or multi_label
         """
+        # ── Multi-label branch ────────────────────────────────────────────────
+        if is_multi_label:
+            from automl.data_validator import DataValidator
+            parsed = DataValidator._parse_multi_labels(df[label_column])
+            all_atomic = sorted({lbl for row in parsed for lbl in row})
+            num_classes = len(all_atomic)
+            # Compute per-label frequency for class-distribution dict
+            from collections import Counter
+            label_counts = Counter(lbl for row in parsed for lbl in row)
+            class_dist = dict(label_counts.most_common())
+            info = {
+                'task_type': 'multi_label',
+                'label_type': 'categorical',
+                'num_classes': num_classes,
+                'class_distribution': class_dist,
+                'class_weights': {lbl: 1.0 for lbl in all_atomic},  # placeholder; computed in train_model
+            }
+            logger.info(f"Task detected: multi_label ({num_classes} unique labels)")
+            logger.info(f"Label distribution: {class_dist}")
+            return info
+
+        # ── Single-label branch (existing logic) ─────────────────────────────
         num_classes = df[label_column].nunique()
+
+        # Guard: fewer than 2 classes → cannot train a classifier
+        if num_classes < 2:
+            raise ValueError(
+                f"Label column '{label_column}' has only {num_classes} unique value(s). "
+                f"Classification requires at least 2 distinct classes."
+            )
+
+        # Guard: stratified split requires at least 2 samples per class
+        class_counts = df[label_column].value_counts()
+        min_class_size = int(class_counts.min())
+        if min_class_size < 2:
+            tiny_class = class_counts.idxmin()
+            raise ValueError(
+                f"Class '{tiny_class}' has only {min_class_size} sample(s). "
+                f"Stratified train/val splitting requires at least 2 samples per class. "
+                f"Remove or merge classes with fewer than 2 samples before running."
+            )
 
         # Guard: if label column is numeric and cardinality is very high relative to the
         # dataset size, it is almost certainly a regression target, not a class label.
@@ -116,35 +195,59 @@ class DataIntelligence:
         
         return info
     
-    def _detect_imbalance(self, df: pd.DataFrame, label_column: str) -> Dict:
+    def _detect_imbalance(
+        self,
+        df: pd.DataFrame,
+        label_column: str,
+        is_multi_label: bool = False,
+    ) -> Dict:
         """
-        Detect class imbalance and recommend handling strategies
-        
-        Args:
-            df: DataFrame
-            label_column: Label column name
-            
-        Returns:
-            Dictionary with imbalance information
+        Detect class imbalance and recommend handling strategies.
+        For multi-label datasets, imbalance is measured across per-label frequencies.
         """
+        if is_multi_label:
+            from automl.data_validator import DataValidator
+            from collections import Counter
+            parsed = DataValidator._parse_multi_labels(df[label_column])
+            label_counts = Counter(lbl for row in parsed for lbl in row)
+            if len(label_counts) > 0:
+                max_count = max(label_counts.values())
+                min_count = min(label_counts.values())
+                imbalance_ratio = max_count / max(min_count, 1)
+                minority_ratio  = min_count / len(df)
+            else:
+                imbalance_ratio, minority_ratio = 1.0, 1.0
+            info = {
+                'imbalance_ratio': imbalance_ratio,
+                # For multi-label we use pos_weight in BCEWithLogitsLoss instead
+                # of per-class CrossEntropy weights.
+                'use_class_weights': imbalance_ratio > 2.0,
+                'use_focal_loss': False,  # focal loss targets single-label tasks
+                'minority_class_ratio': minority_ratio,
+            }
+            logger.info(f"Multi-label imbalance ratio (max/min label freq): {imbalance_ratio:.2f}")
+            if info['use_class_weights']:
+                logger.info("✓ Will use per-label pos_weight for multi-label imbalance")
+            return info
+
         class_counts = df[label_column].value_counts()
         max_count = class_counts.max()
         min_count = class_counts.min()
         imbalance_ratio = max_count / min_count
-        
+
         info = {
             'imbalance_ratio': imbalance_ratio,
             'use_class_weights': imbalance_ratio > 2.0,
             'use_focal_loss': imbalance_ratio > 5.0,
             'minority_class_ratio': min_count / len(df),
         }
-        
+
         logger.info(f"Imbalance ratio: {imbalance_ratio:.2f}")
         if info['use_class_weights']:
             logger.info("✓ Will use class weights for handling imbalance")
         if info['use_focal_loss']:
             logger.info("✓ Dataset is highly imbalanced (ratio > 5), focal loss recommended")
-        
+
         return info
     
     def _analyze_text_length(self, df: pd.DataFrame, text_column: str) -> Dict:
@@ -310,7 +413,163 @@ class DataIntelligence:
             )
 
         return models
-    
+
+    def _recommend_run_options(
+        self,
+        dataset_size: int,
+        samples_per_class: float,
+        imbalance_ratio: float,
+        strategy: str,
+    ) -> Dict:
+        """
+        Recommend whether to run Cross-Validation and/or Optuna based purely
+        on data characteristics — no user input required.
+
+        Returns a dict:
+            use_cv       : bool — whether CV is recommended
+            cv_folds     : int  — how many folds
+            cv_reason    : str  — human-readable reason shown in UI
+            use_optuna   : bool — whether Optuna is recommended
+            optuna_trials: int  — how many trials
+            optuna_reason: str  — human-readable reason shown in UI
+        """
+        # ── Cross-Validation recommendation ──────────────────────────────────
+        # Use compute_val_split() — the same function the trainer uses — so the
+        # estimated val size is always exact, not a hardcoded 0.15 guess.
+        val_ratio        = compute_val_split(dataset_size)
+        val_size_actual  = int(dataset_size * val_ratio)
+        if val_size_actual < 60:
+            use_cv    = True
+            cv_folds  = 5
+            cv_reason = (
+                f"Dataset has only {dataset_size} samples — "
+                f"a single {val_ratio:.0%} val split ({val_size_actual} rows) is too small "
+                f"to trust metrics. 5-fold CV gives a reliable mean ± std."
+            )
+        elif val_size_actual < 120 or imbalance_ratio > 5:
+            use_cv    = True
+            cv_folds  = 5
+            cv_reason = (
+                f"Val split ({val_size_actual} rows) is small"
+                + (f" and class imbalance is {imbalance_ratio:.1f}×" if imbalance_ratio > 5 else "")
+                + ". 5-fold CV provides more stable metrics."
+            )
+        elif dataset_size > 5000:
+            use_cv    = False
+            cv_folds  = 5
+            cv_reason = (
+                f"Dataset has {dataset_size} samples — "
+                f"val split ({val_size_actual} rows) is large enough to be reliable. "
+                f"CV skipped to save time."
+            )
+        else:
+            use_cv    = False
+            cv_folds  = 5
+            cv_reason = (
+                f"Val split ({val_size_actual} rows) is adequate. "
+                f"CV optional — enable if you want confidence intervals."
+            )
+
+        # ── Optuna recommendation ─────────────────────────────────────────────
+        # Dict-based config: every tier is explicit, unknown tiers get a warning
+        # and fall back to MODERATE — never silently to the most aggressive option.
+        # Min trials is 3 (not 0) so that if a user force-enables Optuna on a
+        # CRITICAL dataset the tuner still runs safely.
+        _OPTUNA_CFG = {
+            #  strategy   : (use_optuna, trials, reason)
+            "CRITICAL": (
+                False, 3,
+                f"Only {samples_per_class:.0f} samples/class (CRITICAL tier). "
+                f"Optuna proxy trials need ~30% of data each — too noisy for reliable "
+                f"signal. Rule-based config is more stable here."
+            ),
+            "SMALL": (
+                False, 5,
+                f"{samples_per_class:.0f} samples/class (SMALL tier). "
+                f"Optuna has marginal benefit — rule-based lr is already well-chosen "
+                f"for this range. Enable if you want to experiment."
+            ),
+            "MODERATE": (
+                True, 8,
+                f"{samples_per_class:.0f} samples/class (MODERATE tier). "
+                f"Optuna recommended — enough data for reliable proxy trials, "
+                f"lr/wd tuning typically improves F1 by 1–3%."
+            ),
+            "GOOD": (
+                True, 10,
+                f"{samples_per_class:.0f} samples/class (GOOD tier). "
+                f"Optuna strongly recommended — stable gradients make search reliable, "
+                f"tuned lr/wd consistently outperforms fixed values."
+            ),
+        }
+        if strategy not in _OPTUNA_CFG:
+            logger.warning(
+                "Unknown strategy %r — falling back to MODERATE Optuna config. "
+                "Add this tier to _OPTUNA_CFG if it is intentional.",
+                strategy,
+            )
+        use_optuna, optuna_trials, optuna_reason = _OPTUNA_CFG.get(
+            strategy, _OPTUNA_CFG["MODERATE"]
+        )
+
+        rec = {
+            "use_cv":        use_cv,
+            "cv_folds":      cv_folds,
+            "cv_reason":     cv_reason,
+            "use_optuna":    use_optuna,
+            "optuna_trials": optuna_trials,
+            "optuna_reason": optuna_reason,
+        }
+        logger.info(
+            "AUTO-RECOMMEND — CV: %s (%d-fold)  |  Optuna: %s (%d trials)",
+            use_cv, cv_folds, use_optuna, optuna_trials,
+        )
+        logger.info("  CV reason    : %s", cv_reason)
+        logger.info("  Optuna reason: %s", optuna_reason)
+        return rec
+
+    @staticmethod
+    def _detect_hardware_batch() -> int:
+        """
+        Detect the maximum safe batch size for the current hardware.
+
+        GPU tiers (by total VRAM):
+          >=16 GB -> 32  (A100, RTX 4090, large server GPUs)
+          8-16 GB -> 16  (RTX 3080/4070, T4)
+          4-8 GB  ->  8  (RTX 3060, consumer GPUs)
+          2-4 GB  ->  4  (low-end / laptop GPU)
+          <2 GB   ->  2  (very limited VRAM)
+
+        CPU fallback uses core count.
+        """
+        import torch
+        import os
+        if torch.cuda.is_available():
+            try:
+                total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+                if total_vram_gb >= 16:
+                    hw_batch = 32
+                elif total_vram_gb >= 8:
+                    hw_batch = 16
+                elif total_vram_gb >= 4:
+                    hw_batch = 8
+                elif total_vram_gb >= 2:
+                    hw_batch = 4
+                else:
+                    hw_batch = 2
+                logger.info(
+                    f"GPU: {total_vram_gb:.1f} GB VRAM -> hardware max batch = {hw_batch}"
+                )
+                return hw_batch
+            except Exception:
+                logger.warning("Could not read GPU properties -- defaulting to batch=8")
+                return 8
+        else:
+            cpu_cores = os.cpu_count() or 4
+            hw_batch = min(16, max(4, cpu_cores // 2))
+            logger.info(f"CPU: {cpu_cores} cores -> hardware max batch = {hw_batch}")
+            return hw_batch
+
     def _get_training_config(self, dataset_size: int, imbalance_info: Dict, task_info: Dict) -> Dict:
         """
         Get dynamic training configuration based on ACTUAL data metrics
@@ -348,98 +607,123 @@ class DataIntelligence:
         logger.info(f"Imbalance Ratio: {imbalance_ratio:.2f}x")
         logger.info(f"Distribution Variance: {cv:.2f}")
         
-        # SIMPLE RULE-BASED LOGIC based on samples_per_class
-        # This handles ANY dataset size and number of classes robustly
-        
+        # ── Hardware-aware batch size ─────────────────────────────────────────
+        # Detect the maximum safe batch size for the current hardware FIRST.
+        # Each tier defines an ideal batch; final batch = min(hw_max, tier_ideal)
+        # Gradient accumulation compensates when hw_max < tier_ideal so the
+        # effective batch (batch x accum) always equals the tier ideal.
+        _hw_max_batch = self._detect_hardware_batch()
+
         if samples_per_class < 50:
-            # CRITICAL: Very few samples per class
             strategy = "CRITICAL"
             num_epochs_range = [15, 20]
-            batch_size = 4
+            _tier_batch = 4          # tiny data: small batch keeps gradient noise (helps generalisation)
             learning_rate = 5e-4
-            gradient_accumulation_steps = 2
             warmup_ratio = 0.06
             early_stopping_patience = 7
-            weight_decay = 0.02  # Stronger regularization
-            max_grad_norm = 0.5  # Tighter gradient clipping
-            lr_bounds = (2e-4, 5e-4)       # Optuna skips CRITICAL, but bounds set for completeness
+            weight_decay = 0.0       # off by default; set below only if imbalance detected
+            max_grad_norm = 0.5      # tighter clipping for unstable small-data gradients
+            lr_bounds = (2e-4, 5e-4)
             wd_bounds = (0.01, 0.04)
             lr_scheduler_type = 'cosine'
-            dropout = 0.3
-            label_smoothing_factor = 0.1
-            
-            logger.info(f"\n⚠️  CRITICAL STRATEGY: Only {samples_per_class:.1f} samples/class")
-            logger.info(f"    → Extreme overfitting risk")
-            logger.info(f"    → Using aggressive regularization")
-            logger.info(f"    → Action: Consider collecting more data or data augmentation")
-            
+            dropout = 0.2            # classifier-head dropout -- essential on tiny data
+            label_smoothing_factor = 0.0  # off until data-augmentation stage
+
+            logger.info(f"\n WARNING CRITICAL STRATEGY: Only {samples_per_class:.1f} samples/class")
+            logger.info(f"    -> Extreme overfitting risk")
+            logger.info(f"    -> Classifier dropout ON (0.2)")
+            logger.info(f"    -> Action: Consider collecting more data or data augmentation")
+
         elif samples_per_class < 200:
-            # SMALL: Limited data, needs regularization
             strategy = "SMALL"
             num_epochs_range = [10, 15]
-            batch_size = 8
+            _tier_batch = 8
             learning_rate = 2e-4
-            gradient_accumulation_steps = 2
             warmup_ratio = 0.06
             early_stopping_patience = 6
-            weight_decay = 0.015
+            weight_decay = 0.0
             max_grad_norm = 0.75
-            lr_bounds = (1e-4, 5e-4)       # Higher LR range — small data needs stronger signal
+            lr_bounds = (1e-4, 5e-4)
             wd_bounds = (0.005, 0.03)
             lr_scheduler_type = 'cosine'
-            dropout = 0.2
-            label_smoothing_factor = 0.1
-            
-            logger.info(f"\n🟡 SMALL DATA STRATEGY: {samples_per_class:.1f} samples/class")
-            logger.info(f"    → Enhanced training with regularization")
-            logger.info(f"    → More epochs to learn patterns effectively")
-            
+            dropout = 0.15           # moderate classifier dropout
+            label_smoothing_factor = 0.0
+
+            logger.info(f"\n SMALL DATA STRATEGY: {samples_per_class:.1f} samples/class")
+            logger.info(f"    -> Classifier dropout ON (0.15)")
+
         elif samples_per_class < 500:
-            # MODERATE: Manageable but still careful
             strategy = "MODERATE"
             num_epochs_range = [8, 12]
-            batch_size = 12
+            _tier_batch = 16
             learning_rate = 1e-4
-            gradient_accumulation_steps = 1
             warmup_ratio = 0.06
             early_stopping_patience = 4
-            weight_decay = 0.01
+            weight_decay = 0.0
             max_grad_norm = 1.0
-            lr_bounds = (5e-5, 2e-4)       # Standard fine-tuning range
+            lr_bounds = (5e-5, 2e-4)
             wd_bounds = (0.0, 0.02)
             lr_scheduler_type = 'linear'
-            dropout = 0.15
-            label_smoothing_factor = 0.05
-            
-            logger.info(f"\n🟢 MODERATE DATA STRATEGY: {samples_per_class:.1f} samples/class")
-            logger.info(f"    → Standard training with careful monitoring")
-            
+            dropout = 0.1            # light classifier dropout (approaching the 500 boundary)
+            label_smoothing_factor = 0.0
+
+            logger.info(f"\n MODERATE DATA STRATEGY: {samples_per_class:.1f} samples/class")
+            logger.info(f"    -> Classifier dropout ON (0.1)")
+
         else:
-            # GOOD: Sufficient data
             strategy = "GOOD"
             num_epochs_range = [5, 8]
-            batch_size = 16
+            _tier_batch = 32
             learning_rate = 1e-4
-            gradient_accumulation_steps = 1
             warmup_ratio = 0.06
             early_stopping_patience = 3
-            weight_decay = 0.01
+            weight_decay = 0.0
             max_grad_norm = 1.0
-            lr_bounds = (1e-5, 1e-4)       # Conservative range — more data means lower LR works well
+            lr_bounds = (1e-5, 1e-4)
             wd_bounds = (0.0, 0.02)
             lr_scheduler_type = 'linear'
-            dropout = 0.1
+            dropout = 0.0            # >=500 samples/class: no classifier dropout needed
             label_smoothing_factor = 0.0
-            
-            logger.info(f"\n✅ GOOD DATA STRATEGY: {samples_per_class:.1f} samples/class")
-            logger.info(f"    → Standard fine-tuning approach")
-        
-        # ADJUST for severe imbalance even if samples_per_class is decent
-        if imbalance_ratio > 10:
-            logger.info(f"\n⚠️  SEVERE IMBALANCE DETECTED: {imbalance_ratio:.1f}x")
-            logger.info(f"    → Adjusting early stopping patience")
+
+            logger.info(f"\n GOOD DATA STRATEGY: {samples_per_class:.1f} samples/class")
+            logger.info(f"    -> Classifier dropout OFF (>=500 samples/class)")
+
+        # ── Final batch: hardware-capped, gradient-accum compensated ─────────
+        batch_size = min(_hw_max_batch, _tier_batch)
+        gradient_accumulation_steps = max(1, _tier_batch // batch_size)
+        if gradient_accumulation_steps > 1:
+            logger.info(
+                f"    -> Batch {batch_size} (hw limit) x "
+                f"{gradient_accumulation_steps} grad_accum = {_tier_batch} effective"
+            )
+        else:
+            logger.info(f"    -> Batch size: {batch_size}")
+
+        # ── Weight decay -- ONLY when class imbalance warrants it ─────────────
+        # Default is 0.0 for all tiers. Imbalance makes the loss surface noisy
+        # (minority-class gradients dominate) so L2 regularisation helps stabilise.
+        # Label smoothing stays 0.0 -- reserved for the data-augmentation stage.
+        if imbalance_ratio > 20:
+            weight_decay = 0.03
             early_stopping_patience = max(early_stopping_patience + 2, 5)
-            weight_decay = weight_decay * 1.2
+            logger.info(
+                f"\n SEVERE IMBALANCE ({imbalance_ratio:.1f}x) "
+                f"-> weight_decay=0.03, patience+2"
+            )
+        elif imbalance_ratio > 10:
+            weight_decay = 0.02
+            early_stopping_patience = max(early_stopping_patience + 2, 5)
+            logger.info(
+                f"\n HIGH IMBALANCE ({imbalance_ratio:.1f}x) "
+                f"-> weight_decay=0.02, patience+2"
+            )
+        elif imbalance_ratio > 5:
+            weight_decay = 0.01
+            logger.info(
+                f"\n MODERATE IMBALANCE ({imbalance_ratio:.1f}x) "
+                f"-> weight_decay=0.01"
+            )
+        # else: weight_decay stays 0.0
 
         # Focal gamma scaled by imbalance (only active when use_focal_loss=True)
         if imbalance_ratio > 20:
@@ -473,13 +757,13 @@ class DataIntelligence:
         }
 
         logger.info(f"\n{'='*70}")
-        logger.info(f"📋 TRAINING CONFIG: {strategy} Strategy")
+        logger.info(f"TRAINING CONFIG: {strategy} Strategy")
         logger.info(f"{'='*70}")
-        logger.info(f"Epochs: {num_epochs_range} | Batch: {batch_size} | LR: {learning_rate}")
+        logger.info(f"Epochs: {num_epochs_range} | Batch: {batch_size} (eff: {batch_size * gradient_accumulation_steps}) | LR: {learning_rate}")
         logger.info(f"Scheduler: {lr_scheduler_type} | Warmup ratio: {warmup_ratio}")
-        logger.info(f"Dropout: {dropout} | Label smoothing: {label_smoothing_factor}")
-        logger.info(f"Focal gamma: {focal_gamma} | Weight Decay: {weight_decay} | Max Grad Norm: {max_grad_norm}")
-        logger.info(f"Early Stopping Patience: {early_stopping_patience}")
+        logger.info(f"Classifier Dropout: {dropout} | Weight Decay: {weight_decay} (imbalance-driven)")
+        logger.info(f"Focal gamma: {focal_gamma} | Max Grad Norm: {max_grad_norm}")
+        logger.info(f"Early Stopping Patience: {early_stopping_patience} (monitors val loss)")
         logger.info(f"{'='*70}\n")
         
         return config

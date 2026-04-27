@@ -9,9 +9,6 @@ optuna>=3.14.0,<5.0.0
 tqdm>=4.60.0,<5.0.0
 python-dotenv>=1.0.0,<2.0.0
 
-# Web Interfaces
+# Web Interface
 streamlit>=1.28.0,<2.0.0
-flask>=2.3.0,<4.0.0
-flask-cors>=4.0.0,<6.0.0
-werkzeug>=2.3.0,<4.0.0
-requests>=2.28.0,<3.0.0
+openpyxl>=3.0.0,<4.0.0
